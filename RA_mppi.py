@@ -223,7 +223,7 @@ if __name__ == "__main__":
     np.random.seed(3)
 
     here = os.path.dirname(__file__)
-    csv_path = os.path.join(here, "features_dir2_5_10s.csv")
+    csv_path = os.path.join(here, "Data/features_dir2_5_10s.csv")
 
     pos_scale = 0.10
     vel_scale = 0.10
