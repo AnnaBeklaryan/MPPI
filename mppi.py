@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import argparse
 import time
 import numpy as np
 import pandas as pd
@@ -204,6 +205,10 @@ class MovingObstacleCSV:
 # ============================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run MPPI car simulation.")
+    parser.add_argument("--save", action="store_true", help="Save replay data for plot_car.py")
+    args = parser.parse_args()
+
     np.random.seed(3)
 
     here = os.path.dirname(__file__)
@@ -227,18 +232,20 @@ if __name__ == "__main__":
     if not (np.isfinite(dt) and dt > 0):
         raise ValueError(f"Computed dt is invalid: dt={dt}")
 
-    # MPPI params
-    T = 10
-    M = 1200
-    lam = 2.0
-    sigma = np.array([2., 1.04], dtype=np.float32)
+    # MPPI params (from dr_mppi_tracking_autotune_best.json)
+    T = 20
+    M = 768
+    lam = 0.18481899710220806
+    sigma = np.array([1.1379372168727357, np.deg2rad(4.323568503878927)], dtype=np.float32)
 
-    u_min = np.array([0.0, -np.deg2rad(180.0)], dtype=np.float32)
-    u_max = np.array([10.0,  np.deg2rad(180.0)], dtype=np.float32)
+    u_min = np.array([0.0, -np.deg2rad(118.17883187321553)], dtype=np.float32)
+    u_max = np.array([10.235773671425953, np.deg2rad(118.17883187321553)], dtype=np.float32)
 
-    Q  = np.array([0.001, 0.001, 0.001], dtype=np.float32)
-    Qf = np.array([0.5, 10.0, 1.0], dtype=np.float32)
-    R  = np.array([1e-05, 1e-05], dtype=np.float32)
+    Q = np.array([1.4624828952940474, 3.814814161674933, 1.5344150526354992], dtype=np.float32)
+    Qf = np.array([5.606928604036206, 7.581265139242665, 3.0557509331905637], dtype=np.float32)
+    R = np.array([1.2073103064825688, 1.862976077002867], dtype=np.float32)
+    I = 2
+    dyn_w_max = float(np.deg2rad(174.14583876009493))
 
     mppi = MPPI(
         dt=dt, T=T, M=M, lam=lam,
@@ -248,12 +255,12 @@ if __name__ == "__main__":
         running_cost=running_cost_lane_obs,
         terminal_cost=terminal_cost_track,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        dyn_kwargs=dict(w_max=float(np.deg2rad(180.0))),
+        dyn_kwargs=dict(w_max=dyn_w_max),
         cost_kwargs=dict(
             ref=None, Q=None, R=None, Qf=None,
             O_mean=None, radii=None, obs_w=5e3
         ),
-        I=1,
+        I=I,
         verbose=False
     )
 
@@ -265,8 +272,9 @@ if __name__ == "__main__":
     Qf_t = torch.as_tensor(Qf, device=mppi.device, dtype=mppi.dtype)
 
     lane_psi = 0.0
-    L_ref = 14.0
-    v_des = 5.0
+    L_ref = 13.463124277046475
+    v_des = 7.299317006720202
+    u_blend_v = 0.022225325010346495
 
     ROAD_CENTER = 1.0
     LANE_W = 0.70
@@ -288,77 +296,36 @@ if __name__ == "__main__":
     obs_radius = ego_radius
     extra_margin = 0.0
 
-    car_ego_img = mpimg.imread(os.path.join(here, "Data/car_ego.png"))
-    obs_sprite_paths = [os.path.join(here, f"Data/car_obs{i}.png") for i in range(1, 15)]
-    obs_sprite_imgs = []
-    for p in obs_sprite_paths:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Missing obstacle sprite: {p}")
-        obs_sprite_imgs.append(mpimg.imread(p))
-    NUM_SPRITES = len(obs_sprite_imgs)
-
-    id_to_sprite = {}
-    next_sprite = 0
-
-    # ========================================================
-    # Visualization
-    # ========================================================
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(14., 5.0))
-    fig.subplots_adjust(right=0.80)
-
-    ax.set_facecolor("#646464")
-    ax.set_aspect("auto")
-    ax.set_xlabel("x [scaled m]")
-    ax.set_ylabel("y [scaled m]")
-
-    ax.axhline(y_bottom,  color="white", linewidth=3.0, zorder=2)
-    ax.axhline(y_top,     color="white", linewidth=3.0, zorder=2)
-    ax.axhline(y_divider, color="white", linewidth=2.0, linestyle=(0, (12, 12)),
-               alpha=0.9, zorder=2)
-
-    ax.plot([x_mppi[0] - 100, x_mppi[0] + 500], [lane_y, lane_y],
-            "--", linewidth=1.5, color="#abbac6", alpha=0.8, label="Lane center")
-
     N_SHOW = 60
     N_SHOW = int(min(max(1, N_SHOW), M))
-    sample_lines = []
-    for _ in range(N_SHOW):
-        ln, = ax.plot([], [], lw=1.1, color="#9ee2e9", alpha=0.12, zorder=1)
-        sample_lines.append(ln)
-
-    path_line, = ax.plot([], [], lw=2.6, color="#67bde2", label="Ego path")
-    pred_line, = ax.plot([], [], lw=2.2, color="#36ff0e", alpha=0.95, label="MPPI prediction", zorder=3)
-
-    ego_img_artist = ax.imshow(
-        car_ego_img,
-        extent=[-0.5, 0.5, -0.5, 0.5],
-        zorder=6,
-    )
-
     max_obs_draw = 20
-    obs_imgs = []
-    for _ in range(max_obs_draw):
-        im = ax.imshow(
-            obs_sprite_imgs[0],
-            extent=[-0.5, 0.5, -0.5, 0.5],
-            zorder=4,
-            visible=False,
-        )
-        obs_imgs.append(im)
-
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0.0, frameon=True)
 
     x_ahead = 18.0
     x_behind = 4.0
     y_halfspan = 2.8
 
-    xs, ys = [float(x_mppi[0])], [float(x_mppi[1])]
+    save_dir = os.path.join(here, "plot")
+    save_path = os.path.join(save_dir, "mppi_car_simulation.npz")
+
     steps = min(900, len(obs_csv.times))
+    sim_time = np.full((steps,), np.nan, dtype=np.float32)
+    solve_ms = np.full((steps,), np.nan, dtype=np.float32)
+    X_hist = np.full((steps, 3), np.nan, dtype=np.float32)
+    X_path = np.full((steps + 1, 2), np.nan, dtype=np.float32)
+    X_path[0, :] = x_mppi[:2]
+    pred_nominal_xy = np.full((steps, T + 1, 2), np.nan, dtype=np.float32)
+    pred_samples_xy = np.full((steps, T + 1, N_SHOW, 2), np.nan, dtype=np.float32)
+    obs_xy = np.full((steps, max_obs_draw, 2), np.nan, dtype=np.float32)
+    obs_phi = np.full((steps, max_obs_draw), np.nan, dtype=np.float32)
+    obs_ids = np.full((steps, max_obs_draw), -1, dtype=np.int32)
+    K_hist = np.zeros((steps,), dtype=np.int32)
+    xlim_hist = np.full((steps, 2), np.nan, dtype=np.float32)
+    ylim_hist = np.full((steps, 2), np.nan, dtype=np.float32)
 
     for k in range(steps):
         t_now = float(obs_csv.times[k])
         obs_now = obs_csv.obstacles_now(t_now)
+        sim_time[k] = t_now
 
         dx = obs_now["x"].to_numpy(float) - float(x_mppi[0])
         dy = obs_now["y"].to_numpy(float) - float(x_mppi[1])
@@ -415,32 +382,33 @@ if __name__ == "__main__":
         t1 = time.perf_counter()
 
         print(f"[MPPI Torch] solve_time = {t1 - t0:.6f} s | K={K}")
+        solve_ms[k] = float((t1 - t0) * 1000.0)
         U = np.nan_to_num(U, nan=0.0, posinf=u_max[0], neginf=u_min[0]).astype(np.float32)
 
         # Prediction line (CPU sim)
         x_pred = x_mppi.copy()
-        pred_xs = [float(x_pred[0])]
-        pred_ys = [float(x_pred[1])]
+        pred_nominal_xy[k, 0, 0] = float(x_pred[0])
+        pred_nominal_xy[k, 0, 1] = float(x_pred[1])
         for t in range(T):
-            x_pred = diffdrive_dynamics(x_pred, U[t], dt, v_max=float(u_max[0])).astype(np.float32)
-            pred_xs.append(float(x_pred[0]))
-            pred_ys.append(float(x_pred[1]))
-        pred_line.set_data(pred_xs, pred_ys)
+            x_pred = diffdrive_dynamics(
+                x_pred, U[t], dt, v_max=float(u_max[0]), w_max=dyn_w_max
+            ).astype(np.float32)
+            pred_nominal_xy[k, t + 1, 0] = float(x_pred[0])
+            pred_nominal_xy[k, t + 1, 1] = float(x_pred[1])
 
         # Sample rollout fan
         if Xsamp is not None:
             ns = min(N_SHOW, Xsamp.shape[1])
-            for i in range(ns):
-                sample_lines[i].set_data(Xsamp[:, i, 0], Xsamp[:, i, 1])
-            for i in range(ns, N_SHOW):
-                sample_lines[i].set_data([], [])
+            pred_samples_xy[k, :, :ns, :] = Xsamp[:, :ns, :2].astype(np.float32)
 
         # Apply first control + mild speed smoothing
         u0 = U[0].copy()
-        u0[0] = np.clip(0.4 * u0[0] + 0.6 * v_des, 0.0, float(u_max[0]))
+        u0[0] = np.clip(u_blend_v * u0[0] + (1.0 - u_blend_v) * v_des, 0.0, float(u_max[0]))
         u0 = np.nan_to_num(u0, nan=0.0, posinf=u_max[0], neginf=u_min[0])
 
-        x_mppi = diffdrive_dynamics(x_mppi, u0, dt, v_max=float(u_max[0])).astype(np.float32)
+        x_mppi = diffdrive_dynamics(
+            x_mppi, u0, dt, v_max=float(u_max[0]), w_max=dyn_w_max
+        ).astype(np.float32)
 
         if not np.all(np.isfinite(x_mppi)):
             print(f"[ERROR] Non-finite ego state at step {k}, t={t_now:.3f}: x_mppi={x_mppi}, u0={u0}")
@@ -451,34 +419,6 @@ if __name__ == "__main__":
         mppi.U[-1] = np.array([v_des, 0.0], dtype=np.float32)
         mppi.U_cpu = mppi.U  # keep internal storage consistent too
 
-        xs.append(float(x_mppi[0])); ys.append(float(x_mppi[1]))
-        path_line.set_data(xs, ys)
-
-        set_img_pose(ego_img_artist, x_mppi[0], x_mppi[1], x_mppi[2], ego_length, ego_width, ax)
-
-        # Draw obstacles
-        for i in range(max_obs_draw):
-            if i < K:
-                obs_id = int(draw_pack["ids"][i])
-                if obs_id not in id_to_sprite:
-                    id_to_sprite[obs_id] = next_sprite
-                    next_sprite = (next_sprite + 1) % NUM_SPRITES
-
-                sprite_idx = id_to_sprite[obs_id]
-                obs_imgs[i].set_data(obs_sprite_imgs[sprite_idx])
-                obs_imgs[i].set_visible(True)
-                set_img_pose(
-                    obs_imgs[i],
-                    draw_pack["xy"][i, 0],
-                    draw_pack["xy"][i, 1],
-                    float(draw_pack["phi"][i]),
-                    obs_length,
-                    obs_width,
-                    ax
-                )
-            else:
-                obs_imgs[i].set_visible(False)
-
         CAM_X_AHEAD  = 9.0
         CAM_X_BEHIND = 9.0
         CAM_Y_HALF   = 2.0
@@ -487,17 +427,52 @@ if __name__ == "__main__":
         x_right = float(x_mppi[0] + CAM_X_AHEAD)
         y_low   = float(lane_y - CAM_Y_HALF)
         y_high  = float(lane_y + CAM_Y_HALF)
+        xlim_hist[k, :] = [x_left, x_right]
+        ylim_hist[k, :] = [y_low, y_high]
 
-        if np.isfinite(x_left) and np.isfinite(x_right) and np.isfinite(y_low) and np.isfinite(y_high):
-            ax.set_xlim(x_left, x_right)
-            ax.set_ylim(y_low, y_high)
-        else:
+        if not (np.isfinite(x_left) and np.isfinite(x_right) and np.isfinite(y_low) and np.isfinite(y_high)):
             print(f"[WARN] Skipping axis update due to non-finite limits: "
                   f"x=({x_left},{x_right}) y=({y_low},{y_high}) x_mppi={x_mppi}")
             break
 
-        ax.set_title(f"MPPI | t={t_now:.2f}s | K={K} | solve={t1 - t0:.3f}s")
-        plt.pause(0.01)
+        X_hist[k, :] = x_mppi
+        X_path[k + 1, :] = x_mppi[:2]
+        K_hist[k] = K
+        if K > 0:
+            kk = min(K, max_obs_draw)
+            obs_xy[k, :kk, :] = draw_pack["xy"][:kk, :2].astype(np.float32)
+            obs_phi[k, :kk] = draw_pack["phi"][:kk].astype(np.float32)
+            obs_ids[k, :kk] = draw_pack["ids"][:kk].astype(np.int32)
 
-    plt.ioff()
-    plt.show()
+    if args.save:
+        os.makedirs(save_dir, exist_ok=True)
+        np.savez_compressed(
+            save_path,
+            method=np.array("mppi"),
+            dt=np.array(dt, dtype=np.float32),
+            T=np.array(T, dtype=np.int32),
+            M=np.array(M, dtype=np.int32),
+            N_SHOW=np.array(N_SHOW, dtype=np.int32),
+            max_obs_draw=np.array(max_obs_draw, dtype=np.int32),
+            lane_y=np.array(lane_y, dtype=np.float32),
+            y_bottom=np.array(y_bottom, dtype=np.float32),
+            y_top=np.array(y_top, dtype=np.float32),
+            y_divider=np.array(y_divider, dtype=np.float32),
+            ego_length=np.array(ego_length, dtype=np.float32),
+            ego_width=np.array(ego_width, dtype=np.float32),
+            obs_length=np.array(obs_length, dtype=np.float32),
+            obs_width=np.array(obs_width, dtype=np.float32),
+            sim_time=sim_time,
+            solve_ms=solve_ms,
+            X_hist=X_hist,
+            X_path=X_path,
+            pred_nominal_xy=pred_nominal_xy,
+            pred_samples_xy=pred_samples_xy,
+            obs_xy=obs_xy,
+            obs_phi=obs_phi,
+            obs_ids=obs_ids,
+            K_hist=K_hist,
+            xlim_hist=xlim_hist,
+            ylim_hist=ylim_hist,
+        )
+        print(f"[SAVE] wrote {save_path}")

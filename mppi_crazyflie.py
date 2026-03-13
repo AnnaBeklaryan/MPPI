@@ -12,19 +12,19 @@ Control: u = [T, phi_cmd, theta_cmd, psi_dot_cmd]
 State:   x = [px,py,pz, vx,vy,vz, psi]
 
 This version:
-- Runs simulation first and stores data in buffers
-- Plays animation from buffered data after the run
+- Runs simulation and stores data in buffers
+- Saves buffers to .npz for offline plotting/replay
 - Prints solve time during simulation
 """
 
 from __future__ import annotations
+import argparse
 import time
 import math
+import os
 from dataclasses import dataclass
 
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 
 import torch
 from mppi_class import MPPI  # your Torch MPPI
@@ -39,23 +39,6 @@ def wrap_pi(a: float) -> float:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
-
-
-def rotation_matrix_zyx(phi, theta, psi):
-    cphi = math.cos(phi); sphi = math.sin(phi)
-    cth  = math.cos(theta); sth = math.sin(theta)
-    cpsi = math.cos(psi); spsi = math.sin(psi)
-
-    Rz = np.array([[cpsi, -spsi, 0.0],
-                   [spsi,  cpsi, 0.0],
-                   [0.0,   0.0,  1.0]])
-    Ry = np.array([[ cth, 0.0, sth],
-                   [0.0, 1.0, 0.0],
-                   [-sth, 0.0, cth]])
-    Rx = np.array([[1.0, 0.0, 0.0],
-                   [0.0, cphi, -sphi],
-                   [0.0, sphi,  cphi]])
-    return Rz @ Ry @ Rx
 
 
 # -----------------------------
@@ -193,25 +176,6 @@ def build_min_snap_3d(waypoints_xyz, avg_speed=1.5):
     return MinSnapTraj(wps, seg_times, cx, cy, cz, float(seg_times.sum()))
 
 
-# -----------------------------
-# Plot cylinders
-# -----------------------------
-def plot_cylinders(ax, cylinders, n_theta=40, n_z=8):
-    for c in cylinders:
-        cx, cy, r = c["cx"], c["cy"], c["r"]
-        zmin = c.get("zmin", 0.0)
-        zmax = c.get("zmax", 1.0)
-
-        theta = np.linspace(0, 2*np.pi, n_theta)
-        z = np.linspace(zmin, zmax, n_z)
-        Theta, Z = np.meshgrid(theta, z)
-
-        X = cx + r * np.cos(Theta)
-        Y = cy + r * np.sin(Theta)
-
-        ax.plot_wireframe(X, Y, Z, linewidth=0.6, alpha=0.5)
-
-
 # ============================================================
 # Torch dynamics & costs
 # ============================================================
@@ -331,8 +295,8 @@ def terminal_cost_quad(X, t_final, ref_seq, Qf, **_kwargs):
 @dataclass
 class MPPIParams:
     dt: float = 0.02
-    horizon_steps: int = 60
-    rollouts: int = 2048
+    horizon_steps: int = 40
+    rollouts: int = 500
     iterations: int = 2
     lam: float = 1.0
     sigma: np.ndarray | None = None
@@ -376,15 +340,9 @@ class TorchMPPIQuadOuter:
         self.u_min = np.array([self.p.T_min, -self.p.ang_max, -self.p.ang_max, -self.p.yawrate_max], dtype=np.float32)
         self.u_max = np.array([self.p.T_max,  self.p.ang_max,  self.p.ang_max,  self.p.yawrate_max], dtype=np.float32)
 
-        self.R_np = np.array(
-            [1.0/(hover**2),
-             1.0/(self.p.ang_max**2),
-             1.0/(self.p.ang_max**2),
-             1.0/(self.p.yawrate_max**2)],
-            dtype=np.float32
-        )
+        sigma_np = np.asarray(self.p.sigma, dtype=np.float32).reshape(4,)
+        self.R_np = 1.0 / np.maximum(sigma_np ** 2, 1e-12).astype(np.float32)
 
-        self.R_np *= 0.2   
         self.Rd_np = np.asarray(self.p.Rd_u, dtype=np.float32).reshape(4,)
 
         self.dt = float(self.p.dt)
@@ -445,7 +403,35 @@ class TorchMPPIQuadOuter:
         self.mppi.U_cpu[:, 0] = hover
         self.mppi.U = self.mppi.U_cpu
 
-    def plan(self, x0_np, ref_seq_np, Q_np, Qf_np, obs_seq_np):
+    def _predict_nominal_xyz(self, x0_np, U_cpu):
+        x = torch.as_tensor(np.asarray(x0_np, dtype=np.float32).reshape(1, 9), device=self.device, dtype=torch.float32)
+        pred = np.zeros((self.T + 1, 3), dtype=np.float32)
+        pred[0] = np.asarray(x0_np, dtype=np.float32).reshape(9,)[0:3]
+        dyn = self.mppi.dyn_kwargs
+        for t in range(self.T):
+            u_t = torch.as_tensor(U_cpu[t].reshape(1, 4), device=self.device, dtype=torch.float32)
+            x = quad_dyn_step(
+                x, u_t, self.dt, self.m, self.g,
+                tau_phi=dyn.get("tau_phi", self.p.tau_phi),
+                tau_theta=dyn.get("tau_theta", self.p.tau_theta),
+                ang_max=dyn.get("ang_max", self.p.ang_max),
+                phi_rate_max=dyn.get("phi_rate_max", self.p.phi_rate_max),
+                theta_rate_max=dyn.get("theta_rate_max", self.p.theta_rate_max),
+            )
+            pred[t + 1] = x[0, 0:3].detach().cpu().numpy().astype(np.float32)
+        return pred
+
+    def plan(
+        self,
+        x0_np,
+        ref_seq_np,
+        Q_np,
+        Qf_np,
+        obs_seq_np,
+        return_predictions=False,
+        n_pred=20,
+        include_nominal_prediction=True,
+    ):
         ref_seq_t = torch.as_tensor(ref_seq_np, device=self.device, dtype=torch.float32)
         Q_t  = torch.as_tensor(Q_np,  device=self.device, dtype=torch.float32)
         Qf_t = torch.as_tensor(Qf_np, device=self.device, dtype=torch.float32)
@@ -467,20 +453,34 @@ class TorchMPPIQuadOuter:
         else:
             ck["cyl_cx"] = ck["cyl_cy"] = ck["cyl_r"] = ck["cyl_zmin"] = ck["cyl_zmax"] = None
 
-        U_cpu, _ = self.mppi.plan(x0_np, return_samples=False)
+        U_cpu, Xsamp = self.mppi.plan(
+            x0_np,
+            return_samples=bool(return_predictions),
+            n_show=int(n_pred),
+            show_seed=0,
+        )
         u0 = U_cpu[0].copy()
+        pred_samples_xyz = None
+        pred_nominal_xyz = None
+        if return_predictions:
+            if Xsamp is not None:
+                pred_samples_xyz = np.asarray(Xsamp[:, :, 0:3], dtype=np.float32)
+            if include_nominal_prediction:
+                pred_nominal_xyz = self._predict_nominal_xyz(x0_np, U_cpu)
 
         # warm-start shift
         self.mppi.U_cpu[:-1] = self.mppi.U_cpu[1:]
         self.mppi.U_cpu[-1] = self.mppi.U_cpu[-2]
         self.mppi.U = self.mppi.U_cpu
+        if return_predictions:
+            return u0, pred_samples_xyz, pred_nominal_xyz
         return u0
 
 
 # -----------------------------
-# Buffered Simulation / Visualization
+# Buffered Simulation / Data Export
 # -----------------------------
-def simulate():
+def simulate(save_dir: str | None = None):
     waypoints = np.array([
         [ 2.5,  2.0, 0.0],
         [ 0.0,  3.5, 2.0],
@@ -501,6 +501,24 @@ def simulate():
         [ 2.5,  2.0, 0.0],
     ], dtype=float)
 
+    # waypoints_2 = np.array([
+    #     [ 2.5,  2.0, 0.0],
+    #     [ 0.0,  3.5, 2.0],
+    #     [-3.0,  1.5, 4.5],
+    #     [-2.0, -2.5, 3.0],
+    #     [ 2.0, -3.0, 1.0],
+    #     [ 3.0,  0.0, 0.5],
+    #     [ 2.5,  2.0, 0.0],
+    # ], dtype=float)
+
+    waypoints_2 = np.array([
+        [ 2.5,  2.0, 0.0],
+        [-2.0, -2.5, 3.0],
+        [ 0.0,  3.5, 2.0],
+        [ 3.0,  0.0, 0.5],
+        [ 2.5,  2.0, 0.0],
+    ], dtype=float)
+
     traj = build_min_snap_3d(waypoints, avg_speed=1.8)
 
     cylinders = [
@@ -510,34 +528,34 @@ def simulate():
         {"cx": -1.0, "cy":  4.0, "r": 0.7, "zmin": 0.0, "zmax": 4.5},
     ]
 
-    moving_offsets = [
-        np.array([0.40, -0.30, 0.00], dtype=float),
-        np.array([-0.70, 0.45, 0.30], dtype=float),
-        np.array([0.85, 0.60, -0.20], dtype=float),
+    moving_waypoint_sets = [waypoints_1, waypoints_2]
+
+    moving_trajs = [
+        build_min_snap_3d(moving_waypoint_sets[i], avg_speed=1.8)
+        for i in range(2)
     ]
-    moving_trajs = [build_min_snap_3d(waypoints_1 + off, avg_speed=1.8) for off in moving_offsets]
 
     params = MPPIParams(
-        dt=0.02365431268834492,
-        horizon_steps=50,
-        rollouts=2048,
-        iterations=2,
-        lam=0.8444146922964824,
+        dt=0.028677838561381404,
+        horizon_steps=35,
+        rollouts=1096,
+        iterations=1,
+        lam=0.9447651256582109,
         sigma=np.array(
             [
-                0.043029010625575535,
-                math.radians(4.954352217068673),
-                math.radians(7.702984740619588),
-                math.radians(24.490391108169387),
+                0.03860791271607059,
+                math.radians(6.072834867326699),
+                math.radians(7.139534744261536),
+                math.radians(9.50181217517332),
             ],
             dtype=np.float32,
         ),
-        ang_max=math.radians(42.52350986190698),
-        yawrate_max=math.radians(173.74212275188287),
-        tau_phi=0.19171151474569642,
-        tau_theta=0.16905177236157454,
-        phi_rate_max=math.radians(302.76732088763026),
-        theta_rate_max=math.radians(205.07368428551388),
+        ang_max=math.radians(28.533048677493525),
+        yawrate_max=math.radians(125.002671219858),
+        tau_phi=0.22445102088241203,
+        tau_theta=0.19182828711184713,
+        phi_rate_max=math.radians(186.91775798517736),
+        theta_rate_max=math.radians(250.74834372828798),
         w_cyl=510.6988597095838,
         cyl_safety_margin=0.2150292356967072,
         cyl_alpha=8.72155294537059,
@@ -545,15 +563,15 @@ def simulate():
         moving_r=0.3045201563139591,
         moving_safety_margin=0.4224283788684363,
         moving_alpha=15.033309531167399,
-        Rd_u=(0.1391209429786332, 0.17400953848855316, 1.3542346730954953, 0.9273697619931647),
+        Rd_u=(0.9046852667672367, 2.390585391824126, 2.8043325852902052, 1.0686213306251247),
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ctrl = TorchMPPIQuadOuter(mass=0.028, g=9.81, params=params, cylinders=cylinders, device=device)
     print("Planner backend:", device)
 
-    Q = np.array([70.83921979768184, 101.7158401270657, 24.804057074906098, 0.0], dtype=np.float32)
-    Qf = np.array([161.80431672271496, 242.31023361428362, 85.67477925065472, 0.0], dtype=np.float32)
+    Q = np.array([84.46141326914871, 49.474546616417555, 61.1121046345, 0.0], dtype=np.float32)
+    Qf = np.array([303.4373360699704, 193.59494682617972, 231.06814617684867, 0.0], dtype=np.float32)
     dt = params.dt
     sim_T = max([traj.total_time] + [mt.total_time for mt in moving_trajs])
     steps = int(sim_T / dt) + 1
@@ -575,7 +593,7 @@ def simulate():
             return fallback
         return math.atan2(vy, vx)
 
-    lead_time = 1.704014105868615
+    lead_time = 1.724533520574184
 
     # precompute curves for drawing
     tt = np.linspace(0.0, traj.total_time, 600)
@@ -600,11 +618,14 @@ def simulate():
     X_hist = np.zeros((steps, 9), dtype=float)
     n_obs = len(moving_trajs)
     obs_path = np.zeros((steps, n_obs, 3), dtype=float)
+    n_pred_plot = min(8, ctrl.M)
+    pred_stride = 1
+    pred_samples_xyz = np.full((steps, ctrl.T + 1, n_pred_plot, 3), np.nan, dtype=np.float32)
+    pred_nominal_xyz = np.full((steps, ctrl.T + 1, 3), np.nan, dtype=np.float32)
     U_applied = np.zeros((steps, 4), dtype=float)
     solve_ms = np.zeros((steps,), dtype=float)
     sim_time = np.arange(steps, dtype=float) * dt
 
-    # run simulation first
     for i in range(steps):
         t = i * dt
 
@@ -630,32 +651,65 @@ def simulate():
                 op, _ = moving_traj.eval(tk)
                 obs_seq[k, j] = op
 
+        obs_path[i] = obs_seq[0]
+
         if ctrl.device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        u = ctrl.plan(x, ref_seq, Q, Qf, obs_seq)
+        # LAG HOTSPOT:
+        # Enabling prediction collection triggers sample extraction + GPU->CPU transfer.
+        # Lower frequency (increase pred_stride) to reduce solve-time overhead.
+        collect_pred = (i % pred_stride) == 0
+        if collect_pred:
+            u, pred_s_xyz, pred_nom_xyz = ctrl.plan(
+                x,
+                ref_seq,
+                Q,
+                Qf,
+                obs_seq,
+                return_predictions=True,
+                n_pred=n_pred_plot,
+                include_nominal_prediction=True,
+            )
+        else:
+            u = ctrl.plan(x, ref_seq, Q, Qf, obs_seq, return_predictions=False)
+            pred_s_xyz = None
+            pred_nom_xyz = None
         if ctrl.device.type == "cuda":
             torch.cuda.synchronize()
         solve_ms[i] = (time.perf_counter() - t0) * 1000.0
+        # LAG HOTSPOT:
+        # Storing full prediction buffers each step increases memory traffic.
+        if collect_pred and pred_s_xyz is not None:
+            ns = min(n_pred_plot, int(pred_s_xyz.shape[1]))
+            pred_samples_xyz[i, :, :ns, :] = pred_s_xyz[:, :ns, :]
+        elif i > 0:
+            pred_samples_xyz[i] = pred_samples_xyz[i - 1]
+        if collect_pred and pred_nom_xyz is not None:
+            pred_nominal_xyz[i] = pred_nom_xyz
+        elif i > 0:
+            pred_nominal_xyz[i] = pred_nominal_xyz[i - 1]
 
         if (i % 10) == 0:
-            print(f"[step {i:04d}] t={t:6.2f}s | solve={solve_ms[i]:7.2f} ms")
+            print(f"[step {i:04d}] solve_ms={solve_ms[i]:.2f}")
 
-        Tcmd, phi_cmd, theta_cmd, yawrate = u
-        Tcmd = clamp(float(Tcmd), ctrl.p.T_min, ctrl.p.T_max)
-        phi_cmd = clamp(float(phi_cmd), -ctrl.p.ang_max, ctrl.p.ang_max)
-        theta_cmd = clamp(float(theta_cmd), -ctrl.p.ang_max, ctrl.p.ang_max)
-        yawrate = clamp(float(yawrate), -ctrl.p.yawrate_max, ctrl.p.yawrate_max)
+        Tcmd, phi_cmd, theta_cmd, yawrate = map(float, u)
+        Tcmd = clamp(Tcmd, ctrl.p.T_min, ctrl.p.T_max)
+        phi_cmd = clamp(phi_cmd, -ctrl.p.ang_max, ctrl.p.ang_max)
+        theta_cmd = clamp(theta_cmd, -ctrl.p.ang_max, ctrl.p.ang_max)
+        yawrate = clamp(yawrate, -ctrl.p.yawrate_max, ctrl.p.yawrate_max)
         U_applied[i] = [Tcmd, phi_cmd, theta_cmd, yawrate]
 
         phi = float(x[7])
         theta = float(x[8])
         cphi = math.cos(phi); sphi = math.sin(phi)
-        cth  = math.cos(theta); sth = math.sin(theta)
+        cth = math.cos(theta); sth = math.sin(theta)
         cpsi = math.cos(x[6]); spsi = math.sin(x[6])
-        zb = np.array([cpsi*sth*cphi + spsi*sphi,
-                       spsi*sth*cphi - cpsi*sphi,
-                       cth*cphi], dtype=float)
+        zb = np.array([
+            cpsi*sth*cphi + spsi*sphi,
+            spsi*sth*cphi - cpsi*sphi,
+            cth*cphi,
+        ], dtype=float)
         a = (Tcmd / ctrl.m) * zb - np.array([0.0, 0.0, ctrl.g])
         phi_dot = (phi_cmd - phi) / max(1e-6, ctrl.p.tau_phi)
         theta_dot = (theta_cmd - theta) / max(1e-6, ctrl.p.tau_theta)
@@ -670,114 +724,38 @@ def simulate():
 
         X_path[i] = x[0:3]
         X_hist[i] = x.copy()
-        obs_path[i] = obs_seq[0]
 
-    # playback animation
-    fig = plt.figure(figsize=(10, 7))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_title("Torch MPPI Playback (buffered run)")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Altitude")
-    ax.plot(ref_curve[:, 0], ref_curve[:, 1], ref_curve[:, 2], linestyle=":", linewidth=2, label="Reference")
-    for idx, obs_curve in enumerate(obs_curves):
-        ax.plot(obs_curve[:, 0], obs_curve[:, 1], obs_curve[:, 2], linestyle="--", linewidth=1,
-                label="Obstacle nominal" if idx == 0 else None)
-    ax.scatter(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2], s=40, label="Waypoints")
-    plot_cylinders(ax, cylinders)
-
-    ax.set_xlim(mins[0], maxs[0])
-    ax.set_ylim(mins[1], maxs[1])
-    ax.set_zlim(mins[2], maxs[2])
-
-    traj_line, = ax.plot([], [], [], linewidth=2, label="Drone path")
-    obs_traces = [ax.plot([], [], [], linewidth=1.5, label="Obstacle used" if i == 0 else None)[0] for i in range(n_obs)]
-    obs_pts = [ax.plot([], [], [], marker="o", markersize=7, linestyle="")[0] for _ in range(n_obs)]
-    arm_len = 0.35
-    arm1, = ax.plot([], [], [], linewidth=2)
-    arm2, = ax.plot([], [], [], linewidth=2)
-    center_pt, = ax.plot([], [], [], marker="o", markersize=4, linestyle="")
-    txt = ax.text2D(0.03, 0.95, "", transform=ax.transAxes)
-    ax.legend(loc="best")
-
-    def set_segment(line, p_center, direction, half_len):
-        p0 = p_center - half_len * direction
-        p1 = p_center + half_len * direction
-        line.set_data([p0[0], p1[0]], [p0[1], p1[1]])
-        line.set_3d_properties([p0[2], p1[2]])
-
-    def init_anim():
-        traj_line.set_data([], [])
-        traj_line.set_3d_properties([])
-        for j in range(n_obs):
-            obs_traces[j].set_data([], [])
-            obs_traces[j].set_3d_properties([])
-            obs_pts[j].set_data([], [])
-            obs_pts[j].set_3d_properties([])
-        arm1.set_data([], [])
-        arm1.set_3d_properties([])
-        arm2.set_data([], [])
-        arm2.set_3d_properties([])
-        center_pt.set_data([], [])
-        center_pt.set_3d_properties([])
-        txt.set_text("")
-        return (traj_line, *obs_traces, *obs_pts, arm1, arm2, center_pt, txt)
-
-    def update_anim(i):
-        traj_line.set_data(X_path[:i + 1, 0], X_path[:i + 1, 1])
-        traj_line.set_3d_properties(X_path[:i + 1, 2])
-        for j in range(n_obs):
-            obs_traces[j].set_data(obs_path[:i + 1, j, 0], obs_path[:i + 1, j, 1])
-            obs_traces[j].set_3d_properties(obs_path[:i + 1, j, 2])
-            obs_pts[j].set_data([obs_path[i, j, 0]], [obs_path[i, j, 1]])
-            obs_pts[j].set_3d_properties([obs_path[i, j, 2]])
-
-        p = X_hist[i, 0:3]
-        psi = X_hist[i, 6]
-        phi = X_hist[i, 7]
-        theta = X_hist[i, 8]
-        Rm = rotation_matrix_zyx(phi, theta, psi)
-        xb = Rm[:, 0]
-        yb = Rm[:, 1]
-        d1 = xb + yb
-        d2 = xb - yb
-        d1 = d1 / (np.linalg.norm(d1) + 1e-12)
-        d2 = d2 / (np.linalg.norm(d2) + 1e-12)
-        set_segment(arm1, p, d1, arm_len)
-        set_segment(arm2, p, d2, arm_len)
-        center_pt.set_data([p[0]], [p[1]])
-        center_pt.set_3d_properties([p[2]])
-        txt.set_text(f"t={sim_time[i]:.2f}s | solve={solve_ms[i]:.1f} ms")
-        return (traj_line, *obs_traces, *obs_pts, arm1, arm2, center_pt, txt)
-
-    _ani = FuncAnimation(
-        fig,
-        update_anim,
-        init_func=init_anim,
-        frames=steps,
-        interval=int(1000 * dt),
-        blit=False,
-        repeat=False,
-    )
-
-    fig2, ax2 = plt.subplots(figsize=(10, 3.5))
-    ax2.plot(sim_time, solve_ms, linewidth=1.0)
-    ax2.set_title("MPPI Solve Time per Step")
-    ax2.set_xlabel("Time [s]")
-    ax2.set_ylabel("Solve [ms]")
-    ax2.grid(True, alpha=0.3)
-
-    fig3, ax3 = plt.subplots(4, 1, figsize=(10, 7), sharex=True)
-    labels = ["Thrust [N]", "Roll cmd [rad]", "Pitch cmd [rad]", "Yaw-rate cmd [rad/s]"]
-    for j in range(4):
-        ax3[j].plot(sim_time, U_applied[:, j], linewidth=1.0)
-        ax3[j].set_ylabel(labels[j])
-        ax3[j].grid(True, alpha=0.3)
-    ax3[-1].set_xlabel("Time [s]")
-    fig3.suptitle("Applied Control Inputs (Buffered)")
-
-    plt.show()
+    run_data = {
+        "method": "mppi",
+        "dt": float(dt),
+        "sim_time": sim_time,
+        "X_path": X_path,
+        "X_hist": X_hist,
+        "obs_path": obs_path,
+        "U_applied": U_applied,
+        "solve_ms": solve_ms,
+        "ref_curve": ref_curve,
+        "obs_curves": np.asarray(obs_curves, dtype=float),
+        "mins": mins,
+        "maxs": maxs,
+        "pred_samples_xyz": pred_samples_xyz,
+        "pred_nominal_xyz": pred_nominal_xyz,
+        "cylinders": np.asarray(
+            [[c["cx"], c["cy"], c["r"], c.get("zmin", 0.0), c.get("zmax", 1.0)] for c in cylinders],
+            dtype=float,
+        ),
+    }
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, "mppi_simulation.npz")
+        np.savez_compressed(out_path, **run_data)
+        print(f"Saved simulation data to {out_path}")
+    return run_data
 
 
 if __name__ == "__main__":
-    simulate()
+    parser = argparse.ArgumentParser(description="Run MPPI Crazyflie simulation.")
+    parser.add_argument("--save", action="store_true", help="Save simulation .npz to the plot directory.")
+    args = parser.parse_args()
+    save_dir = os.path.join(os.path.dirname(__file__), "plot") if args.save else None
+    simulate(save_dir=save_dir)

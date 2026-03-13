@@ -1,0 +1,8 @@
+Metric,MPPI,RAMPPI,DRMPPI,DRAMPPI
+1) Min distance across runs (min of run minima),1.0233,1.0301,1.0191,1.0207
+2) Run-min distance (mean ± std),1.0664 ± (0.0198),1.0628 ± (0.0206),1.0524 ± (0.0170),1.0443 ± (0.0135)
+3) Safety violation probability using (r + r_s),0.0000,0.0000,0.0000,0.0000
+4) Collision probability using (r),0.0000,0.0000,0.0000,0.0000
+5) Total cost Q+Sigma^-2 only (mean ± std),49167.0878 ± (738.2123),54022.8483 ± (1530.7104),53403.7391 ± (1235.9320),51091.7110 ± (1435.2350)
+6) Max compute time across runs (ms),467.4647,276.4417,487.8913,975.1376
+7) Run-max compute time (mean ± std) (ms),109.7735 ± (87.3581),106.1623 ± (51.2185),112.1124 ± (94.3164),255.9706 ± (188.0991)
