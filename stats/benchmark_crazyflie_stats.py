@@ -10,7 +10,6 @@ Outputs:
 - summary_table_paper.csv
 - summary_table_numeric.csv
 - run_metrics.csv
-- histogram / violin / box plots for run-level metrics
 
 python benchmark_crazyflie_stats.py \
   --runs 30 \
@@ -832,48 +831,11 @@ def main():
     out_compact = os.path.join(args.outdir, "summary_table_numeric.csv")
     compact_df.to_csv(out_compact, index=False)
 
-    make_three_plots(
-        metric_key="run_min_distance",
-        title_root="Minimum Separation Distance Across Runs",
-        x_label="Minimum separation distance (m)",
-        per_alg={k: np.asarray(v["run_min_dist"], dtype=np.float64) for k, v in per_alg.items()},
-        outdir=args.outdir,
-    )
-    make_three_plots(
-        metric_key="total_q_sigma_inv_stage_cost",
-        title_root="Total Tracking and Control Cost Across Runs",
-        x_label=r"Total cost, $\sum_k (e_k^\top Q e_k + u_k^\top \Sigma^{-2} u_k)$",
-        per_alg={k: np.asarray(v["total_qr_cost"], dtype=np.float64) for k, v in per_alg.items()},
-        outdir=args.outdir,
-    )
-    make_three_plots(
-        metric_key="run_max_compute_time_ms",
-        title_root="Maximum Per-Run Solve Time",
-        x_label="Maximum solve time per run (ms)",
-        per_alg={k: 1000.0 * np.asarray(v["run_max_compute_time_s"], dtype=np.float64) for k, v in per_alg.items()},
-        outdir=args.outdir,
-    )
-    make_three_plots(
-        metric_key="safety_violation_indicator",
-        title_root="Safety-Violation Indicator Across Runs",
-        x_label="Safety-violation indicator",
-        per_alg={k: np.asarray(v["safety_violation"], dtype=np.float64) for k, v in per_alg.items()},
-        outdir=args.outdir,
-    )
-    make_three_plots(
-        metric_key="collision_indicator",
-        title_root="Collision Indicator Across Runs",
-        x_label="Collision indicator",
-        per_alg={k: np.asarray(v["collision"], dtype=np.float64) for k, v in per_alg.items()},
-        outdir=args.outdir,
-    )
-
     print("\n=== Paper Table (rows=metrics, cols=algorithms) ===", flush=True)
     print(table.to_string(index=False), flush=True)
     print(f"\n[OK] wrote: {out_table}", flush=True)
     print(f"[OK] wrote: {out_compact}", flush=True)
     print(f"[OK] wrote: {out_raw}", flush=True)
-    print(f"[OK] plots saved in: {args.outdir}", flush=True)
 
 
 if __name__ == "__main__":

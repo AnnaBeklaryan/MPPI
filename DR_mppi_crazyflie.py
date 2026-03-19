@@ -304,7 +304,7 @@ def terminal_cost_quad(X: torch.Tensor, t_final: int, ref_seq: torch.Tensor, Qf:
 @dataclass
 class DRParams:
     dt: float = 0.02
-    horizon_steps: int = 60
+    horizon_steps: int = 50
     rollouts: int = 1096
     iterations: int = 2
     lam: float = 1.0
@@ -342,6 +342,7 @@ class DRParams:
 
     # drone radius included in safe radius for feasibility
     drone_radius: float = 0.25
+    R_u: tuple[float, float, float, float] = (3681.657818871252, 1942.4889645039902, 1942.4889645039902, 51.2938492189335)
     # control-smoothing weight around nominal sequence
     Rd_u: tuple[float, float, float, float] = (0.0, 3.0, 3.0, 0.5)
 
@@ -374,9 +375,7 @@ class TorchDRMPPIQuadOuter:
         self.u_min = np.array([T_min, -self.p.ang_max, -self.p.ang_max, -self.p.yawrate_max], dtype=np.float32)
         self.u_max = np.array([T_max,  self.p.ang_max,  self.p.ang_max,  self.p.yawrate_max], dtype=np.float32)
 
-        # Diagonal Sigma^{-1} for control effort weights.
-        sigma_np = np.asarray(self.p.sigma, dtype=np.float32).reshape(4,)
-        self.R_np = 1.0 / np.maximum(sigma_np ** 2, 1e-12).astype(np.float32)
+        self.R_np = np.asarray(self.p.R_u, dtype=np.float32).reshape(4,)
         self.Rd_np = np.asarray(self.p.Rd_u, dtype=np.float32).reshape(4,)
 
         # cylinders -> torch
@@ -604,7 +603,7 @@ def simulate(save_dir: str | None = None):
 
         sigma=np.array(
             [
-                0.03860791271607059,  # sigma_T_ratio * hover from crazyflie_dr_tracking_autotune_best.json
+                0.03860791271607059,
                 math.radians(6.072834867326699),
                 math.radians(7.139534744261536),
                 math.radians(9.50181217517332),
@@ -628,6 +627,7 @@ def simulate(save_dir: str | None = None):
         dr_eps_cvar=0.030026822645753973,
 
         drone_radius=0.3662153322325755,
+        R_u=(3681.657818871252, 1942.4889645039902, 1942.4889645039902, 51.2938492189335),
         Rd_u=(0.9046852667672367, 2.390585391824126, 2.8043325852902052, 1.0686213306251247),
     )
 
@@ -636,8 +636,13 @@ def simulate(save_dir: str | None = None):
     print("Planner backend:", device)
 
     # tracking weights (yaw disabled)
-    Q = np.array([84.46141326914871, 49.474546616417555, 61.1121046345, 0.0], dtype=np.float32)
-    Qf = np.array([303.4373360699704, 193.59494682617972, 231.06814617684867, 0.0], dtype=np.float32)
+    Q = np.array([121.54191793531642, 120.7320008579965, 143.93311001418877, 0.0], dtype=np.float32)
+    Qf = np.array([
+        4.24444323202221 * 121.54191793531642,
+        2.2842848307817354 * 120.7320008579965,
+        3.7565634665191308 * 143.93311001418877,
+        0.0,
+    ], dtype=np.float32)
 
     dt = params.dt
     sim_T = max([traj.total_time] + [mt.total_time for mt in moving_trajs])
@@ -659,7 +664,7 @@ def simulate(save_dir: str | None = None):
             return fallback
         return math.atan2(vy, vx)
 
-    lead_time = 1.724533520574184  # seconds (from crazyflie_dr_tracking_autotune_best.json)
+    lead_time = 1.5495997771078638  # seconds (from crazyflie_dr_tracking_autotune_best.json)
 
     # Precompute curves for reference drawing
     tt = np.linspace(0.0, traj.total_time, 600)

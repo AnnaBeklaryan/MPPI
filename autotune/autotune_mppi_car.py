@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-Tracking-only autotune for MPPI_final/DR_mppi.py.
+Autotune plain MPPI parameters for the car setup in MPPI_final/mppi.py.
 
-This tuner intentionally keeps DR risk/avoidance parameters fixed and only tunes
-tracking/controller parameters.
-
-Important:
-- `sigma_v` / `sigma_w_deg` tune MPPI sampling noise only
-- `Rv` / `Rw` tune the actual control effort penalty `R`
-- this script does not use `Sigma^{-1}` as the control cost weight
+This runs the same closed-loop car scenario used by the main simulation script,
+but headless, and performs a simple random search over tracking/controller
+parameters. The best configuration is written to JSON.
 """
 
 from __future__ import annotations
@@ -30,53 +26,41 @@ MPPI_DIR = Path(__file__).resolve().parents[1]
 if str(MPPI_DIR) not in sys.path:
     sys.path.insert(0, str(MPPI_DIR))
 
-from DR_mppi import (  # noqa: E402
-    DR_MPPI,
+from mppi import (  # noqa: E402
+    MPPI,
     MovingObstacleCSV,
     angle_wrap,
-    diffdrive_dynamics_cpu,
+    diffdrive_dynamics,
     dyn_diffdrive,
     running_cost_lane_obs,
     terminal_cost_track,
 )
 
 
-# Fixed DR/avoidance params from DR_mppi.py (not tuned here)
-FIXED_CVAR_ALPHA = 0.95
-FIXED_CVAR_N = 6
-FIXED_OBS_POS_SIGMA = (0.25, 0.25)
-FIXED_DR_EPS_CVAR = 0.03
-FIXED_OBS_NOISE_MODE = "per_step"
-FIXED_EXTRA_MARGIN = 0.03
-
-
 def sample_cfg(rng: random.Random):
     return {
-        # planner / rollout
         "T": rng.choice([15, 20, 25, 30, 35]),
         "M": rng.choice([512, 768, 1024, 1200, 1536]),
-        "I": rng.choice([1, 2]),
-        "lam": rng.uniform(0.005, 0.25),
-        # control noise for MPPI sampling
-        "sigma_v": rng.uniform(0.2, 1.6),
-        "sigma_w_deg": rng.uniform(4.0, 35.0),
-        # limits / dynamics
+        "I": rng.choice([1, 2, 3]),
+        "lam": rng.uniform(0.01, 0.30),
+        "sigma_v": rng.uniform(0.2, 1.8),
+        "sigma_w_deg": rng.uniform(3.0, 35.0),
         "u_max_v": rng.uniform(7.0, 12.0),
-        "u_max_w_deg": rng.uniform(70.0, 160.0),
+        "u_max_w_deg": rng.uniform(80.0, 180.0),
         "dyn_w_max_deg": rng.uniform(90.0, 180.0),
-        # tracking/control costs
-        "Qx": rng.uniform(0.05, 2.0),
-        "Qy": rng.uniform(2.0, 20.0),
-        "Qpsi": rng.uniform(0.05, 2.0),
-        "Qf_x_scale": rng.uniform(1.2, 5.0),
-        "Qf_y_scale": rng.uniform(1.2, 5.0),
-        "Qf_psi_scale": rng.uniform(1.2, 5.0),
-        "Rv": rng.uniform(0.2, 2.0),
-        "Rw": rng.uniform(0.2, 2.0),
-        # reference policy
+        "Qx": rng.uniform(0.05, 3.0),
+        "Qy": rng.uniform(1.0, 12.0),
+        "Qpsi": rng.uniform(0.05, 3.0),
+        "Qf_x_scale": rng.uniform(1.5, 5.0),
+        "Qf_y_scale": rng.uniform(1.5, 5.0),
+        "Qf_psi_scale": rng.uniform(1.5, 5.0),
+        "Rv": rng.uniform(0.1, 2.5),
+        "Rw": rng.uniform(0.1, 2.5),
         "L_ref": rng.uniform(8.0, 20.0),
         "v_des": rng.uniform(4.0, 10.0),
         "u_blend_v": rng.uniform(0.0, 0.7),
+        "obs_w": rng.uniform(1e3, 2e4),
+        "extra_margin": rng.uniform(0.0, 0.15),
     }
 
 
@@ -88,10 +72,10 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
     T = int(cfg["T"])
     M = int(cfg["M"])
     lam = float(cfg["lam"])
-    # Sampling noise only. Control effort cost comes from R below.
     sigma = np.array([float(cfg["sigma_v"]), math.radians(float(cfg["sigma_w_deg"]))], dtype=np.float32)
     u_min = np.array([0.0, -math.radians(float(cfg["u_max_w_deg"]))], dtype=np.float32)
     u_max = np.array([float(cfg["u_max_v"]), math.radians(float(cfg["u_max_w_deg"]))], dtype=np.float32)
+    dyn_w_max = math.radians(float(cfg["dyn_w_max_deg"]))
 
     Q = np.array([float(cfg["Qx"]), float(cfg["Qy"]), float(cfg["Qpsi"])], dtype=np.float32)
     Qf = np.array([
@@ -101,9 +85,7 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
     ], dtype=np.float32)
     R = np.array([float(cfg["Rv"]), float(cfg["Rw"])], dtype=np.float32)
 
-    dyn_w_max = math.radians(float(cfg["dyn_w_max_deg"]))
-
-    mppi = DR_MPPI(
+    mppi = MPPI(
         dt=dt,
         T=T,
         M=M,
@@ -117,14 +99,8 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
         device=device,
         dtype=torch.float32,
         I=int(cfg["I"]),
-        # fixed DR params
-        cvar_alpha=FIXED_CVAR_ALPHA,
-        cvar_N=FIXED_CVAR_N,
-        obs_pos_sigma=FIXED_OBS_POS_SIGMA,
-        obs_noise_mode=FIXED_OBS_NOISE_MODE,
-        dr_eps_cvar=FIXED_DR_EPS_CVAR,
         dyn_kwargs=dict(w_max=dyn_w_max),
-        cost_kwargs=dict(ref=None, Q=None, R=None, Qf=None, O_mean=None, radii=None, obs_w=0.0),
+        cost_kwargs=dict(ref=None, Q=None, R=None, Qf=None, O_mean=None, radii=None, obs_w=float(cfg["obs_w"])),
         verbose=False,
     )
 
@@ -135,17 +111,18 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
     lane_psi = 0.0
     road_center = 1.0
     lane_w = 0.70
-    lane_y = road_center - 0.5 * lane_w  # matches DR_mppi.py
+    lane_y = road_center + 0.5 * lane_w
+    x_mppi = np.array([0.0, lane_y, 0.0], dtype=np.float32)
 
     L_ref = float(cfg["L_ref"])
     v_des = float(cfg["v_des"])
     blend = float(cfg["u_blend_v"])
-    x_mppi = np.array([0.0, lane_y, 0.0], dtype=np.float32)
 
     ego_length = 4.5 * pos_scale
     ego_width = 1.8 * pos_scale
     ego_radius = 0.5 * np.sqrt(ego_length**2 + ego_width**2)
     obs_radius = ego_radius
+    extra_margin = float(cfg["extra_margin"])
     max_obs_draw = 20
 
     steps = min(int(max_steps), len(obs_csv.times))
@@ -171,14 +148,13 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
         obs_now = obs_now[mask].copy()
 
         if len(obs_now) > 0:
-            dist2 = (obs_now["x"] - float(x_mppi[0]))**2 + (obs_now["y"] - float(x_mppi[1]))**2
+            dist2 = (obs_now["x"] - float(x_mppi[0])) ** 2 + (obs_now["y"] - float(x_mppi[1])) ** 2
             obs_now = obs_now.iloc[np.argsort(dist2.to_numpy())]
             obs_now = obs_now.iloc[:max_obs_draw].copy()
 
         ids, O_mean, _ = obs_csv.build_prediction_for_mppi(obs_df=obs_now, dt=dt, T=T, max_obs=max_obs_draw)
-        K = len(ids)
-        if K > 0:
-            radii_for_mppi = np.full((K,), obs_radius + ego_radius + FIXED_EXTRA_MARGIN, dtype=np.float32)
+        if len(ids) > 0:
+            radii_for_mppi = np.full((len(ids),), obs_radius + ego_radius + extra_margin, dtype=np.float32)
         else:
             radii_for_mppi = np.array([], dtype=np.float32)
 
@@ -209,7 +185,7 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
 
         u0 = U[0].copy()
         u0[0] = np.clip(blend * u0[0] + (1.0 - blend) * v_des, 0.0, float(u_max[0]))
-        x_next = diffdrive_dynamics_cpu(x_mppi, u0, dt, v_max=float(u_max[0]), w_max=dyn_w_max).astype(np.float32)
+        x_next = diffdrive_dynamics(x_mppi, u0, dt, v_max=float(u_max[0]), w_max=dyn_w_max).astype(np.float32)
 
         lane_err = float(x_next[1] - lane_y)
         psi_err = float(angle_wrap(x_next[2] - lane_psi))
@@ -223,7 +199,7 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
         if len(obs_now) > 0:
             obs_xy = obs_now[["x", "y"]].to_numpy(float)
             d = np.linalg.norm(obs_xy - x_next[None, :2], axis=1)
-            safe = obs_radius + ego_radius + FIXED_EXTRA_MARGIN
+            safe = obs_radius + ego_radius + extra_margin
             viol = np.maximum(0.0, safe - d)
             coll_viol_sq += float(np.sum(viol * viol))
 
@@ -242,11 +218,11 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
     coll_viol_mean = coll_viol_sq / steps
     mean_solve_ms = 1000.0 * (sum_solve / steps)
 
-    # tracking-focused objective (no risk/avoidance penalty term)
     score = (
         2.0 * lane_rmse
         + 1.0 * psi_rmse
         + 0.25 * du_rms
+        + 8.0 * coll_viol_mean
         + 0.001 * mean_solve_ms
     )
 
@@ -264,13 +240,13 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Tracking-only autotune for DR_mppi.py")
+    ap = argparse.ArgumentParser(description="Autotune plain MPPI car parameters")
     ap.add_argument("--trials", type=int, default=60, help="Random candidates to evaluate")
     ap.add_argument("--max-steps", type=int, default=420, help="Max simulation steps per candidate")
     ap.add_argument("--seed", type=int, default=11, help="Random seed")
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     ap.add_argument("--csv-path", type=str, default="", help="Optional override CSV path")
-    ap.add_argument("--save-json", type=str, default="dr_mppi_tracking_autotune_best.json")
+    ap.add_argument("--save-json", type=str, default="mppi_car_autotune_best.json")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -309,12 +285,6 @@ def main():
 
     print("Tuning keys:", ", ".join(tuned_keys))
     print("Device:", device)
-    print(
-        "Fixed DR risk params:",
-        f"cvar_alpha={FIXED_CVAR_ALPHA}, cvar_N={FIXED_CVAR_N}, "
-        f"obs_pos_sigma={FIXED_OBS_POS_SIGMA}, dr_eps_cvar={FIXED_DR_EPS_CVAR}, "
-        f"obs_noise_mode={FIXED_OBS_NOISE_MODE}, extra_margin={FIXED_EXTRA_MARGIN}"
-    )
 
     for trial in range(1, int(args.trials) + 1):
         cfg = sample_cfg(random)
@@ -323,6 +293,7 @@ def main():
             f"[trial {trial:03d}/{args.trials}] score={score:.4f} "
             f"lane_rmse={metrics.get('lane_rmse', float('nan')):.3f} "
             f"psi_rmse={metrics.get('psi_rmse', float('nan')):.3f} "
+            f"coll={metrics.get('collision_violation_mean', float('nan')):.5f} "
             f"solve_ms={metrics.get('mean_solve_ms', float('nan')):.2f}"
         )
         if score < best_score:
@@ -336,15 +307,7 @@ def main():
         "best_cfg": best_cfg,
         "best_metrics": best_metrics,
         "tuned_keys": tuned_keys,
-        "fixed_dr_params": {
-            "cvar_alpha": FIXED_CVAR_ALPHA,
-            "cvar_N": FIXED_CVAR_N,
-            "obs_pos_sigma": list(FIXED_OBS_POS_SIGMA),
-            "dr_eps_cvar": FIXED_DR_EPS_CVAR,
-            "obs_noise_mode": FIXED_OBS_NOISE_MODE,
-            "extra_margin": FIXED_EXTRA_MARGIN,
-        },
-        "notes": "Tracking-only tuning for DR_mppi.py; risk/avoidance params are fixed and excluded from search.",
+        "notes": "Plain MPPI car tuning for MPPI_final/mppi.py using the CSV moving-obstacle scenario.",
     }
 
     with open(args.save_json, "w", encoding="utf-8") as f:

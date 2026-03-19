@@ -436,16 +436,17 @@ if __name__ == "__main__":
     if not (np.isfinite(dt) and dt > 0):
         raise ValueError(f"Invalid dt computed from CSV: dt={dt}")
 
-    T = 20
-    M = 768
-    lam = 0.18481899710220806
-    sigma = np.array([1.1379372168727357, np.deg2rad(4.323568503878927)], dtype=np.float32)
-    u_min = np.array([0.0, -np.deg2rad(118.17883187321553)], dtype=np.float32)
-    u_max = np.array([10.235773671425953, np.deg2rad(118.17883187321553)], dtype=np.float32)
+    # Core controller params matched to mppi_1.py
+    T = 10
+    M = 1200
+    lam = 2.0
+    sigma = np.array([2.0, 1.04], dtype=np.float32)
+    u_min = np.array([0.0, -np.deg2rad(180.0)], dtype=np.float32)
+    u_max = np.array([10.0, np.deg2rad(180.0)], dtype=np.float32)
 
-    Q = np.array([1.4624828952940474, 3.814814161674933, 1.5344150526354992], dtype=np.float32)
-    Qf = np.array([5.606928604036206, 7.581265139242665, 3.0557509331905637], dtype=np.float32)
-    R = np.array([1.2073103064825688, 1.862976077002867], dtype=np.float32)
+    Q = np.array([0.001, 0.001, 0.001], dtype=np.float32)
+    Qf = np.array([0.5, 10.0, 1.0], dtype=np.float32)
+    R = np.array([1e-5, 1e-5], dtype=np.float32)
 
     sigma_cp = 0.05
     Nmc = 20000
@@ -465,7 +466,7 @@ if __name__ == "__main__":
         Qf=Qf,
         u_min=u_min,
         u_max=u_max,
-        I=2,
+        I=1,
         sigma_cp=sigma_cp,
         Nmc=Nmc,
         omega_soft=omega_soft,
@@ -479,9 +480,9 @@ if __name__ == "__main__":
     print("[DRA_MPPI] device =", mppi.device)
 
     lane_psi = 0.0
-    L_ref = 13.463124277046475
-    v_des = 7.299317006720202
-    u_blend_v = 0.022225325010346495
+    L_ref = 14.0
+    v_des = 5.0
+    u_blend_v = 0.4
 
     ROAD_CENTER = 1.0
     LANE_W = 0.70

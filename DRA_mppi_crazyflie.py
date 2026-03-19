@@ -337,6 +337,7 @@ class DRAParams:
 
     # drone radius included in safe radius for DRA collision sphere
     drone_radius: float = 0.25
+    R_u: tuple[float, float, float, float] = (3681.657818871252, 1942.4889645039902, 1942.4889645039902, 51.2938492189335)
     # control-smoothing weight around nominal sequence
     Rd_u: tuple[float, float, float, float] = (0.0, 3.0, 3.0, 0.5)
 
@@ -566,8 +567,7 @@ class TorchDRAMPPIQuadOuter:
         self.u_min = np.array([T_min, -self.p.ang_max, -self.p.ang_max, -self.p.yawrate_max], dtype=np.float32)
         self.u_max = np.array([T_max, self.p.ang_max, self.p.ang_max, self.p.yawrate_max], dtype=np.float32)
 
-        sigma_np = np.asarray(self.p.sigma, dtype=np.float32).reshape(4,)
-        self.R_np = 1.0 / np.maximum(sigma_np ** 2, 1e-12).astype(np.float32)
+        self.R_np = np.asarray(self.p.R_u, dtype=np.float32).reshape(4,)
         self.Rd_np = np.asarray(self.p.Rd_u, dtype=np.float32).reshape(4,)
 
         cyl = cylinders if cylinders is not None else []
@@ -759,25 +759,25 @@ def simulate(save_dir: str | None = None):
     ]
 
     params = DRAParams(
-        dt=0.028677838561381404,
-        horizon_steps=35,
+        dt=0.02996248908665903,
+        horizon_steps=30,
         rollouts=1096,
-        iterations=1,
-        lam=0.9447651256582109,
+        iterations=3,
+        lam=1.7217069331021713,
 
-        ang_max=math.radians(28.533048677493525),
-        yawrate_max=math.radians(125.002671219858),
-        tau_phi=0.22445102088241203,
-        tau_theta=0.19182828711184713,
-        phi_rate_max=math.radians(186.91775798517736),
-        theta_rate_max=math.radians(250.74834372828798),
+        ang_max=math.radians(33.49854615635426),
+        yawrate_max=math.radians(148.3483867510077),
+        tau_phi=0.15646930582600807,
+        tau_theta=0.1289492904389256,
+        phi_rate_max=math.radians(196.65290492700933),
+        theta_rate_max=math.radians(309.97307189479557),
 
         sigma=np.array(
             [
-                0.03860791271607059,
-                math.radians(6.072834867326699),
-                math.radians(7.139534744261536),
-                math.radians(9.50181217517332),
+                0.16117122234183265 * (0.028 * 9.81),
+                math.radians(6.072366431457663),
+                math.radians(6.458613847448689),
+                math.radians(8.504193095914168),
             ],
             dtype=np.float32,
         ),
@@ -799,7 +799,8 @@ def simulate(save_dir: str | None = None):
         mc_chunk=512,
 
         drone_radius=0.3662153322325755,
-        Rd_u=(0.9046852667672367, 2.390585391824126, 2.8043325852902052, 1.0686213306251247),
+        R_u=(3681.657818871252, 1942.4889645039902, 1942.4889645039902, 51.2938492189335),
+        Rd_u=(0.3491343127671377, 3.7517067671204343, 1.8171820397487715, 0.2283688032073783),
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -807,8 +808,13 @@ def simulate(save_dir: str | None = None):
     print("Planner backend:", device)
 
     # tracking weights (yaw disabled)
-    Q = np.array([84.46141326914871, 49.474546616417555, 61.1121046345, 0.0], dtype=np.float32)
-    Qf = np.array([303.4373360699704, 193.59494682617972, 231.06814617684867, 0.0], dtype=np.float32)
+    Q = np.array([121.54191793531642, 120.7320008579965, 143.93311001418877, 0.0], dtype=np.float32)
+    Qf = np.array([
+        4.24444323202221 * 121.54191793531642,
+        2.2842848307817354 * 120.7320008579965,
+        3.7565634665191308 * 143.93311001418877,
+        0.0,
+    ], dtype=np.float32)
 
     dt = params.dt
     sim_T = max([traj.total_time] + [mt.total_time for mt in moving_trajs])
@@ -830,7 +836,7 @@ def simulate(save_dir: str | None = None):
             return fallback
         return math.atan2(vy, vx)
 
-    lead_time = 1.724533520574184
+    lead_time = 1.5495997771078638
 
     # Precompute curves for reference drawing
     tt = np.linspace(0.0, traj.total_time, 600)

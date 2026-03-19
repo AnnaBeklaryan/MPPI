@@ -45,6 +45,14 @@ from RA_mppi_crazyflie import Params as RAParams, TorchRAQuad  # noqa: E402
 from DRA_mppi_crazyflie import DRAParams, TorchDRAMPPIQuadOuter  # noqa: E402
 
 
+FIXED_TRACKING_PARAMS = {
+    "dr": {
+        "horizon_steps": 30,
+        "rollouts": 1096,
+    }
+}
+
+
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -150,7 +158,14 @@ def sample_candidate(rng: random.Random, mode: str):
             "sigma_theta_deg": rng.uniform(0.4, 10.0),
             "sigma_yawrate_deg": rng.uniform(1.0, 45.0),
         })
+    cfg.update(FIXED_TRACKING_PARAMS.get(mode, {}))
     return cfg
+
+
+def tuned_keys_for_mode(mode: str) -> list[str]:
+    keys = sorted(sample_candidate(random.Random(0), mode).keys())
+    fixed = set(FIXED_TRACKING_PARAMS.get(mode, {}).keys())
+    return [k for k in keys if k not in fixed]
 
 
 def build_controller(mode: str, cfg: dict, cylinders, device: str):
@@ -388,10 +403,12 @@ def main():
     best_score = float("inf")
     best_cfg = None
     best_metrics = None
-    tuned_keys = sorted(sample_candidate(random.Random(args.seed), args.mode).keys())
+    tuned_keys = tuned_keys_for_mode(args.mode)
     print(f"Mode: {args.mode}")
     print("Tracking tuning keys:", ", ".join(tuned_keys))
     print("Risk parameters are fixed to controller dataclass defaults.")
+    if args.mode in FIXED_TRACKING_PARAMS:
+        print(f"Fixed tracking params: {FIXED_TRACKING_PARAMS[args.mode]}")
 
     for trial in range(1, int(args.trials) + 1):
         cfg = sample_candidate(random, args.mode)
@@ -419,6 +436,7 @@ def main():
         "best_cfg": best_cfg,
         "best_metrics": best_metrics,
         "tuned_keys": tuned_keys,
+        "fixed_tracking_params": FIXED_TRACKING_PARAMS.get(args.mode, {}),
         "objective": "tracking_only",
         "notes": "Tracking params tuned without solve-time penalties; DR/RA/DRA risk params kept at dataclass defaults.",
     }

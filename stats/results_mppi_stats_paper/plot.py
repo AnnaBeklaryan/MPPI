@@ -120,6 +120,30 @@ def _paper_box_axes(ax: plt.Axes) -> None:
         spine.set_color("#333333")
 
 
+def _silverman_bandwidth(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return np.nan
+    std = float(np.std(x, ddof=1))
+    if not np.isfinite(std) or std <= 0.0:
+        return np.nan
+    return 1.06 * std * (x.size ** (-1.0 / 5.0))
+
+
+def _gaussian_kde_pdf(x: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return np.full_like(grid, np.nan, dtype=float)
+    h = _silverman_bandwidth(x)
+    if not np.isfinite(h) or h <= 0.0:
+        return np.full_like(grid, np.nan, dtype=float)
+    z = (grid[:, None] - x[None, :]) / h
+    kernel = np.exp(-0.5 * z * z) / np.sqrt(2.0 * np.pi)
+    return np.mean(kernel, axis=1) / h
+
+
 def plot_reference_style_boxplot(
     run_df: pd.DataFrame,
     column: str,
@@ -485,16 +509,36 @@ def _draw_reference_histogram_on_axis(
         return
 
     stacked = np.concatenate(all_vals)
-    xmin = float(np.min(stacked))
-    xmax = float(np.max(stacked))
-    if xmax <= xmin:
-        pad = 1e-6 if xmin == 0.0 else 0.05 * abs(xmin)
-        xmin, xmax = xmin - pad, xmax + pad
+    if log_x:
+        log_stacked = np.log10(stacked)
+        xmin = float(np.min(log_stacked))
+        xmax = float(np.max(log_stacked))
+        if xmax <= xmin:
+            xmin, xmax = xmin - 0.15, xmax + 0.15
+        else:
+            pad = max(0.12 * (xmax - xmin), 0.08)
+            xmin, xmax = xmin - pad, xmax + pad
+        bins = np.logspace(xmin, xmax, 16)
+        kde_grid_log = np.linspace(xmin, xmax, 400)
+        kde_grid = 10.0 ** kde_grid_log
     else:
-        pad = 0.05 * (xmax - xmin)
-        xmin, xmax = xmin - pad, xmax + pad
-
-    bins = np.linspace(xmin, xmax, 20)
+        xmin = float(np.min(stacked))
+        xmax = float(np.max(stacked))
+        if xmax <= xmin:
+            pad = 1e-6 if xmin == 0.0 else 0.08 * abs(xmin)
+            xmin, xmax = xmin - pad, xmax + pad
+        else:
+            widths = []
+            for vals in all_vals:
+                h = _silverman_bandwidth(vals)
+                if np.isfinite(h) and h > 0.0:
+                    widths.append(h)
+            bw_pad = max(widths) * 2.5 if widths else 0.0
+            range_pad = 0.08 * (xmax - xmin)
+            pad = max(range_pad, bw_pad)
+            xmin, xmax = xmin - pad, xmax + pad
+        bins = np.linspace(xmin, xmax, 16)
+        kde_grid = np.linspace(xmin, xmax, 400)
 
     for algo, vals in grouped:
         if vals.size == 0:
@@ -503,20 +547,43 @@ def _draw_reference_histogram_on_axis(
             vals,
             bins=bins,
             stat="count",
-            kde=True,
+            kde=False,
             element="bars",
             fill=True,
             alpha=0.20,
             linewidth=1.2,
-            line_kws={"linewidth": 2.0},
             edgecolor="#555555",
             color=COLORS[algo],
             label=algo,
             ax=ax,
         )
+        if log_x:
+            log_vals = np.log10(vals)
+            pdf_log = _gaussian_kde_pdf(log_vals, kde_grid_log)
+            if np.any(np.isfinite(pdf_log)):
+                bin_width_log = float(np.diff(kde_grid_log[:2])[0])
+                ax.plot(
+                    kde_grid,
+                    pdf_log * len(vals) * bin_width_log,
+                    color=COLORS[algo],
+                    linewidth=2.0,
+                )
+        else:
+            pdf = _gaussian_kde_pdf(vals, kde_grid)
+            if np.any(np.isfinite(pdf)):
+                bin_width = float(np.diff(bins[:2])[0])
+                ax.plot(
+                    kde_grid,
+                    pdf * len(vals) * bin_width,
+                    color=COLORS[algo],
+                    linewidth=2.0,
+                )
 
     if log_x:
         ax.set_xscale("log")
+        ax.set_xlim(bins[0], bins[-1])
+    else:
+        ax.set_xlim(bins[0], bins[-1])
     ax.set_title(title, pad=10)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Count")

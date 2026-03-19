@@ -246,18 +246,17 @@ if __name__ == "__main__":
     if not (np.isfinite(dt) and dt > 0):
         raise ValueError(f"Invalid dt computed from CSV: dt={dt}")
 
-    # Safety params (from dr_mppi_safety_autotune_best_v2.json)
-    T = 15
-    M = 1024
-    lam = 0.21739523859491372
-    sigma = np.array([1.0134190864010681, np.deg2rad(32.067670133051664)], dtype=np.float32)
-    u_min = np.array([0.0, -np.deg2rad(79.43091743290539)], dtype=np.float32)
-    u_max = np.array([9.463706172331404, np.deg2rad(79.43091743290539)], dtype=np.float32)
+    # Core controller params matched to mppi_1.py
+    T = 10
+    M = 1200
+    lam = 2.0
+    sigma = np.array([2.0, 1.04], dtype=np.float32)
+    u_min = np.array([0.0, -np.deg2rad(180.0)], dtype=np.float32)
+    u_max = np.array([10.0, np.deg2rad(180.0)], dtype=np.float32)
 
-    Q = np.array([1.9280837822534018, 19.28173868384513, 2.313205033116019], dtype=np.float32)
-    Qf = np.array([7.172263131706658, 40.67035738033066, 6.350029066872338], dtype=np.float32)
-    # With latest mppi_class.py, control cost weights are injected from Sigma^{-1}.
-    R = np.array([1.7360501398582697, 0.4531768513639747], dtype=np.float32)
+    Q = np.array([0.001, 0.001, 0.001], dtype=np.float32)
+    Qf = np.array([0.5, 10.0, 1.0], dtype=np.float32)
+    R = np.array([1e-5, 1e-5], dtype=np.float32)
 
     # DR-CVaR settings (autotuned)
     cvar_alpha = 0.9306786750644642
@@ -265,8 +264,8 @@ if __name__ == "__main__":
     obs_pos_sigma = (0.30202412775601417, 0.2656071582397748)
     dr_eps_cvar = 0.019725268835558512
     obs_noise_mode = "static"   # "static" or "per_step"
-    I = 2
-    dyn_w_max = float(np.deg2rad(140.8915900964214))
+    I = 1
+    dyn_w_max = float(np.deg2rad(180.0))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -299,9 +298,9 @@ if __name__ == "__main__":
 
     # Lane setup
     lane_psi = 0.0
-    L_ref = 18.62342430668639
-    v_des = 6.6963753392438115
-    u_blend_v = 0.4702057631212527
+    L_ref = 14.0
+    v_des = 5.0
+    u_blend_v = 0.4
 
     ROAD_CENTER = 1.0
     LANE_W = 0.70
@@ -320,7 +319,7 @@ if __name__ == "__main__":
 
     ego_radius = 0.5 * np.sqrt(ego_length**2 + ego_width**2)
     obs_radius = ego_radius
-    extra_margin = 0.06907085734601331
+    extra_margin = 0.0
 
     N_SHOW = 60
     N_SHOW = int(min(max(1, N_SHOW), M))

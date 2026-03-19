@@ -91,9 +91,6 @@ class MPPI:
             self.ctrl_noise_mode = "diag"
             self.noise_std = sig.reshape(1, 1, self.nu)
             self.noise_L = None
-            # Sigma is diagonal std; control weight uses diag(Sigma^{-1}) = 1 / sigma^2
-            eps = torch.tensor(1e-12, device=self.device, dtype=self.dtype)
-            self.ctrl_cost_R_from_sigma = 1.0 / torch.clamp(sig.reshape(-1) ** 2, min=eps)
         elif sig.ndim == 2:
             if sig.shape != (self.nu, self.nu):
                 raise ValueError("noise_sigma cov must be (nu,nu)")
@@ -102,10 +99,6 @@ class MPPI:
             cov = sig + jitter
             self.noise_L = torch.linalg.cholesky(cov)
             self.noise_std = None
-            # For generic running_cost that expects per-control weights,
-            # use diagonal of Sigma^{-1}.
-            inv_cov = torch.linalg.inv(cov)
-            self.ctrl_cost_R_from_sigma = torch.diagonal(inv_cov)
         else:
             raise ValueError("noise_sigma must be (nu,) or (nu,nu)")
 
@@ -128,10 +121,6 @@ class MPPI:
             # cov mode: eps = z @ L^T
             return z @ self.noise_L.T
 
-    def _inject_sigma_inverse_control_weight(self):
-        # Force control cost weight to come from Sigma^{-1} (requested behavior).
-        self.cost_kwargs["R"] = self.ctrl_cost_R_from_sigma
-
     @torch.no_grad()
     def plan(
         self,
@@ -143,7 +132,6 @@ class MPPI:
         x0_t = _as_torch(np.asarray(x0, dtype=np.float32).reshape(-1), self.device, self.dtype)
         nx = int(x0_t.numel())
         U = _as_torch(self.U_cpu, self.device, self.dtype)  # (T,nu)
-        self._inject_sigma_inverse_control_weight()
 
         if return_samples:
             ns = int(min(max(1, int(n_show)), self.M))
@@ -354,7 +342,6 @@ class RA_MPPI(MPPI):
     ):
         x0_t = _as_torch(np.asarray(x0, dtype=np.float32).reshape(-1), self.device, self.dtype)
         U = _as_torch(self.U_cpu, self.device, self.dtype)
-        self._inject_sigma_inverse_control_weight()
 
         if obs_noise_std is not None:
             obs_noise_std = _as_torch(obs_noise_std, self.device, self.dtype)

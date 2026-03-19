@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 import os
 import argparse
 import time
@@ -200,6 +201,65 @@ class MovingObstacleCSV:
         return ids, O_mean, draw_pack
 
 
+def load_car_mppi_params(params_json_path: str | None):
+    defaults = {
+        "T": 10,
+        "M": 1200,
+        "I": 1,
+        "lam": 2.0,
+        "sigma_v": 2.0,
+        "sigma_w_deg": float(np.rad2deg(1.04)),
+        "u_max_v": 10.0,
+        "u_max_w_deg": 180.0,
+        "dyn_w_max_deg": 180.0,
+        "Qx": 0.001,
+        "Qy": 0.001,
+        "Qpsi": 0.001,
+        "Qfx": 0.5,
+        "Qfy": 10.0,
+        "Qfpsi": 1.0,
+        "Rv": 1e-5,
+        "Rw": 1e-5,
+        "L_ref": 14.0,
+        "v_des": 5.0,
+        "u_blend_v": 0.4,
+        "obs_w": 5e3,
+        "extra_margin": 0.0,
+    }
+
+    if not params_json_path or not os.path.exists(params_json_path):
+        return defaults
+
+    with open(params_json_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    cfg = payload.get("best_cfg", payload)
+    tuned = defaults.copy()
+    tuned["T"] = int(cfg.get("T", tuned["T"]))
+    tuned["M"] = int(cfg.get("M", tuned["M"]))
+    tuned["I"] = int(cfg.get("I", tuned["I"]))
+    tuned["lam"] = float(cfg.get("lam", tuned["lam"]))
+    tuned["sigma_v"] = float(cfg.get("sigma_v", tuned["sigma_v"]))
+    tuned["sigma_w_deg"] = float(cfg.get("sigma_w_deg", tuned["sigma_w_deg"]))
+    tuned["u_max_v"] = float(cfg.get("u_max_v", tuned["u_max_v"]))
+    tuned["u_max_w_deg"] = float(cfg.get("u_max_w_deg", tuned["u_max_w_deg"]))
+    tuned["dyn_w_max_deg"] = float(cfg.get("dyn_w_max_deg", tuned["dyn_w_max_deg"]))
+    tuned["Qx"] = float(cfg.get("Qx", tuned["Qx"]))
+    tuned["Qy"] = float(cfg.get("Qy", tuned["Qy"]))
+    tuned["Qpsi"] = float(cfg.get("Qpsi", tuned["Qpsi"]))
+    tuned["Qfx"] = float(cfg.get("Qfx", cfg.get("Qf_x_scale", 0.0) * tuned["Qx"])) if "Qfx" in cfg or "Qf_x_scale" in cfg else tuned["Qfx"]
+    tuned["Qfy"] = float(cfg.get("Qfy", cfg.get("Qf_y_scale", 0.0) * tuned["Qy"])) if "Qfy" in cfg or "Qf_y_scale" in cfg else tuned["Qfy"]
+    tuned["Qfpsi"] = float(cfg.get("Qfpsi", cfg.get("Qf_psi_scale", 0.0) * tuned["Qpsi"])) if "Qfpsi" in cfg or "Qf_psi_scale" in cfg else tuned["Qfpsi"]
+    tuned["Rv"] = float(cfg.get("Rv", tuned["Rv"]))
+    tuned["Rw"] = float(cfg.get("Rw", tuned["Rw"]))
+    tuned["L_ref"] = float(cfg.get("L_ref", tuned["L_ref"]))
+    tuned["v_des"] = float(cfg.get("v_des", tuned["v_des"]))
+    tuned["u_blend_v"] = float(cfg.get("u_blend_v", tuned["u_blend_v"]))
+    tuned["obs_w"] = float(cfg.get("obs_w", tuned["obs_w"]))
+    tuned["extra_margin"] = float(cfg.get("extra_margin", tuned["extra_margin"]))
+    return tuned
+
+
 # ============================================================
 # Main Simulation
 # ============================================================
@@ -207,6 +267,12 @@ class MovingObstacleCSV:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run MPPI car simulation.")
     parser.add_argument("--save", action="store_true", help="Save replay data for plot_car.py")
+    parser.add_argument(
+        "--params-json",
+        type=str,
+        default="",
+        help="Optional parameter JSON. If omitted, built-in defaults from mppi_1.py are used.",
+    )
     args = parser.parse_args()
 
     np.random.seed(3)
@@ -232,20 +298,22 @@ if __name__ == "__main__":
     if not (np.isfinite(dt) and dt > 0):
         raise ValueError(f"Computed dt is invalid: dt={dt}")
 
-    # MPPI params (from dr_mppi_tracking_autotune_best.json)
-    T = 20
-    M = 768
-    lam = 0.18481899710220806
-    sigma = np.array([1.1379372168727357, np.deg2rad(4.323568503878927)], dtype=np.float32)
+    params_json = args.params_json if args.params_json else ""
+    params = load_car_mppi_params(params_json)
 
-    u_min = np.array([0.0, -np.deg2rad(118.17883187321553)], dtype=np.float32)
-    u_max = np.array([10.235773671425953, np.deg2rad(118.17883187321553)], dtype=np.float32)
+    T = int(params["T"])
+    M = int(params["M"])
+    lam = float(params["lam"])
+    sigma = np.array([float(params["sigma_v"]), np.deg2rad(float(params["sigma_w_deg"]))], dtype=np.float32)
 
-    Q = np.array([1.4624828952940474, 3.814814161674933, 1.5344150526354992], dtype=np.float32)
-    Qf = np.array([5.606928604036206, 7.581265139242665, 3.0557509331905637], dtype=np.float32)
-    R = np.array([1.2073103064825688, 1.862976077002867], dtype=np.float32)
-    I = 2
-    dyn_w_max = float(np.deg2rad(174.14583876009493))
+    u_min = np.array([0.0, -np.deg2rad(float(params["u_max_w_deg"]))], dtype=np.float32)
+    u_max = np.array([float(params["u_max_v"]), np.deg2rad(float(params["u_max_w_deg"]))], dtype=np.float32)
+
+    Q = np.array([float(params["Qx"]), float(params["Qy"]), float(params["Qpsi"])], dtype=np.float32)
+    Qf = np.array([float(params["Qfx"]), float(params["Qfy"]), float(params["Qfpsi"])], dtype=np.float32)
+    R = np.array([float(params["Rv"]), float(params["Rw"])], dtype=np.float32)
+    I = int(params["I"])
+    dyn_w_max = float(np.deg2rad(float(params["dyn_w_max_deg"])))
 
     mppi = MPPI(
         dt=dt, T=T, M=M, lam=lam,
@@ -258,13 +326,17 @@ if __name__ == "__main__":
         dyn_kwargs=dict(w_max=dyn_w_max),
         cost_kwargs=dict(
             ref=None, Q=None, R=None, Qf=None,
-            O_mean=None, radii=None, obs_w=5e3
+            O_mean=None, radii=None, obs_w=float(params["obs_w"])
         ),
         I=I,
         verbose=False
     )
 
     print("[MPPI] device =", mppi.device)
+    if params_json and os.path.exists(params_json):
+        print(f"[MPPI] loaded params from {params_json}")
+    else:
+        print("[MPPI] using built-in params from mppi_1.py")
 
     # Pre-move constant weights to GPU once (DON'T redo every loop)
     Q_t  = torch.as_tensor(Q,  device=mppi.device, dtype=mppi.dtype)
@@ -272,9 +344,9 @@ if __name__ == "__main__":
     Qf_t = torch.as_tensor(Qf, device=mppi.device, dtype=mppi.dtype)
 
     lane_psi = 0.0
-    L_ref = 13.463124277046475
-    v_des = 7.299317006720202
-    u_blend_v = 0.022225325010346495
+    L_ref = float(params["L_ref"])
+    v_des = float(params["v_des"])
+    u_blend_v = float(params["u_blend_v"])
 
     ROAD_CENTER = 1.0
     LANE_W = 0.70
@@ -294,7 +366,7 @@ if __name__ == "__main__":
 
     ego_radius = 0.5 * np.sqrt(ego_length**2 + ego_width**2)
     obs_radius = ego_radius
-    extra_margin = 0.0
+    extra_margin = float(params["extra_margin"])
 
     N_SHOW = 60
     N_SHOW = int(min(max(1, N_SHOW), M))

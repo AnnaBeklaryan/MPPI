@@ -534,7 +534,6 @@ def simulate(save_dir: str | None = None):
         build_min_snap_3d(moving_waypoint_sets[i], avg_speed=1.8)
         for i in range(2)
     ]
-
     params = MPPIParams(
         dt=0.028677838561381404,
         horizon_steps=35,
@@ -566,12 +565,18 @@ def simulate(save_dir: str | None = None):
         Rd_u=(0.9046852667672367, 2.390585391824126, 2.8043325852902052, 1.0686213306251247),
     )
 
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ctrl = TorchMPPIQuadOuter(mass=0.028, g=9.81, params=params, cylinders=cylinders, device=device)
     print("Planner backend:", device)
 
-    Q = np.array([84.46141326914871, 49.474546616417555, 61.1121046345, 0.0], dtype=np.float32)
-    Qf = np.array([303.4373360699704, 193.59494682617972, 231.06814617684867, 0.0], dtype=np.float32)
+    Q = np.array([121.54191793531642, 120.7320008579965, 143.93311001418877, 0.0], dtype=np.float32)
+    Qf = np.array([
+        4.24444323202221 * 121.54191793531642,
+        2.2842848307817354 * 120.7320008579965,
+        3.7565634665191308 * 143.93311001418877,
+        0.0,
+    ], dtype=np.float32)
     dt = params.dt
     sim_T = max([traj.total_time] + [mt.total_time for mt in moving_trajs])
     steps = int(sim_T / dt) + 1
@@ -593,7 +598,7 @@ def simulate(save_dir: str | None = None):
             return fallback
         return math.atan2(vy, vx)
 
-    lead_time = 1.724533520574184
+    lead_time = 1.5495997771078638
 
     # precompute curves for drawing
     tt = np.linspace(0.0, traj.total_time, 600)
