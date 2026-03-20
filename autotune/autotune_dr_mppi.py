@@ -286,7 +286,7 @@ def main():
         raise RuntimeError("CUDA requested but not available.")
 
     base_dir = str(MPPI_DIR)
-    csv_path = args.csv_path if args.csv_path else os.path.join(base_dir, "Data/features_dir2_5_10s.csv")
+    csv_path = args.csv_path if args.csv_path else os.path.join(base_dir, "Data/obstacle_data.csv")
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 

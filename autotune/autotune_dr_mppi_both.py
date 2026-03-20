@@ -372,7 +372,7 @@ def main():
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
 
-    csv_path = args.csv_path if args.csv_path else os.path.join(str(MPPI_DIR), "Data/features_dir2_5_10s.csv")
+    csv_path = args.csv_path if args.csv_path else os.path.join(str(MPPI_DIR), "Data/obstacle_data.csv")
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 

@@ -201,8 +201,9 @@ class MovingObstacleCSV:
         return ids, O_mean, draw_pack
 
 
-def load_car_mppi_params(params_json_path: str | None):
-    defaults = {
+def legacy_car_mppi_params():
+    # Keep these defaults aligned with MPPI/mppi.py.
+    return {
         "T": 10,
         "M": 1200,
         "I": 1,
@@ -226,6 +227,10 @@ def load_car_mppi_params(params_json_path: str | None):
         "obs_w": 5e3,
         "extra_margin": 0.0,
     }
+
+
+def load_car_mppi_params(params_json_path: str | None):
+    defaults = legacy_car_mppi_params()
 
     if not params_json_path or not os.path.exists(params_json_path):
         return defaults
@@ -271,14 +276,14 @@ if __name__ == "__main__":
         "--params-json",
         type=str,
         default="",
-        help="Optional parameter JSON. If omitted, built-in defaults from mppi_1.py are used.",
+        help="Optional parameter JSON. If omitted, built-in defaults matching MPPI/mppi.py are used.",
     )
     args = parser.parse_args()
 
     np.random.seed(3)
 
     here = os.path.dirname(__file__)
-    csv_path = os.path.join(here, "Data/features_dir2_5_10s.csv")
+    csv_path = os.path.join(here, "Data/obstacle_data.csv")
 
     pos_scale = 0.10
     vel_scale = 0.10
@@ -336,7 +341,7 @@ if __name__ == "__main__":
     if params_json and os.path.exists(params_json):
         print(f"[MPPI] loaded params from {params_json}")
     else:
-        print("[MPPI] using built-in params from mppi_1.py")
+        print("[MPPI] using built-in params matching MPPI/mppi.py")
 
     # Pre-move constant weights to GPU once (DON'T redo every loop)
     Q_t  = torch.as_tensor(Q,  device=mppi.device, dtype=mppi.dtype)
@@ -354,6 +359,9 @@ if __name__ == "__main__":
     y_divider = ROAD_CENTER
     y_bottom  = ROAD_CENTER - LANE_W
     y_top     = ROAD_CENTER + LANE_W
+    y_divider_top_1 = y_top
+    y_divider_top_2 = y_top + LANE_W
+    y_top_outer = y_top + 2.0 * LANE_W
     lane_y = y_divider + 0.5 * LANE_W
 
     x_mppi = np.array([0.0, lane_y, 0.0], dtype=np.float32)
@@ -497,8 +505,8 @@ if __name__ == "__main__":
 
         x_left  = float(x_mppi[0] - CAM_X_BEHIND)
         x_right = float(x_mppi[0] + CAM_X_AHEAD)
-        y_low   = float(lane_y - CAM_Y_HALF)
-        y_high  = float(lane_y + CAM_Y_HALF)
+        y_low   = float(y_bottom - 0.2)
+        y_high  = float(y_top_outer + 0.2)
         xlim_hist[k, :] = [x_left, x_right]
         ylim_hist[k, :] = [y_low, y_high]
 
@@ -530,6 +538,9 @@ if __name__ == "__main__":
             y_bottom=np.array(y_bottom, dtype=np.float32),
             y_top=np.array(y_top, dtype=np.float32),
             y_divider=np.array(y_divider, dtype=np.float32),
+            y_divider_top_1=np.array(y_divider_top_1, dtype=np.float32),
+            y_divider_top_2=np.array(y_divider_top_2, dtype=np.float32),
+            y_top_outer=np.array(y_top_outer, dtype=np.float32),
             ego_length=np.array(ego_length, dtype=np.float32),
             ego_width=np.array(ego_width, dtype=np.float32),
             obs_length=np.array(obs_length, dtype=np.float32),

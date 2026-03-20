@@ -4,7 +4,7 @@ FULL COMPLETE SCRIPT: RA-MPPI (Torch) with CVaR feasibility filter + your lane/o
 
 This script ASSUMES you have:
   - mppi_class.py  (contains the RA_MPPI class I provided: CVaR feasibility filter, obstacle sampling, etc.)
-  - features_dir2_5_10s.csv
+  - obstacle_data.csv
   - Data/car_ego.png and Data/car_obs1.png..car_obs14.png
 
 Key points:
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     np.random.seed(3)
 
     here = os.path.dirname(__file__)
-    csv_path = os.path.join(here, "Data/features_dir2_5_10s.csv")
+    csv_path = os.path.join(here, "Data/obstacle_data.csv")
 
     pos_scale = 0.10
     vel_scale = 0.10
@@ -248,9 +248,9 @@ if __name__ == "__main__":
     if not (np.isfinite(dt) and dt > 0):
         raise ValueError(f"Computed dt is invalid: dt={dt}")
 
-    # Core controller params matched to mppi_1.py
+    # MPPI params (matched to DR_mppi.py)
     T = 10
-    M = 1200
+    M = 200
     lam = 2.0
     sigma = np.array([2.0, 1.04], dtype=np.float32)
 
@@ -269,7 +269,7 @@ if __name__ == "__main__":
     obs_pos_sigma = (0.1, 0.1)
     obs_noise_mode = "per_step"   # "static" or "per_step"
     I = 1
-    dyn_w_max = float(np.deg2rad(180.0))
+    dyn_w_max = float(np.deg2rad(234.08634709537696))
 
     # IMPORTANT:
     # When using CVaR feasibility, keep obs_w in running_cost = 0.0 (avoid double counting).
@@ -305,7 +305,7 @@ if __name__ == "__main__":
     lane_psi = 0.0
     L_ref = 14.0
     v_des = 5.0
-    u_blend_v = 0.4
+    u_blend_v = 0.5
 
     ROAD_CENTER = 1.0
     LANE_W = 0.70
@@ -313,6 +313,9 @@ if __name__ == "__main__":
     y_divider = ROAD_CENTER
     y_bottom  = ROAD_CENTER - LANE_W
     y_top     = ROAD_CENTER + LANE_W
+    y_divider_top_1 = y_top
+    y_divider_top_2 = y_top + LANE_W
+    y_top_outer = y_top + 2.0 * LANE_W
     lane_y = y_divider + 0.5 * LANE_W
 
     x_mppi = np.array([0.0, lane_y, 0.0], dtype=np.float32)
@@ -456,8 +459,8 @@ if __name__ == "__main__":
 
         x_left  = float(x_mppi[0] - CAM_X_BEHIND)
         x_right = float(x_mppi[0] + CAM_X_AHEAD)
-        y_low   = float(lane_y - CAM_Y_HALF)
-        y_high  = float(lane_y + CAM_Y_HALF)
+        y_low   = float(y_bottom - 0.2)
+        y_high  = float(y_top_outer + 0.2)
         xlim_hist[k, :] = [x_left, x_right]
         ylim_hist[k, :] = [y_low, y_high]
 
@@ -489,6 +492,9 @@ if __name__ == "__main__":
             y_bottom=np.array(y_bottom, dtype=np.float32),
             y_top=np.array(y_top, dtype=np.float32),
             y_divider=np.array(y_divider, dtype=np.float32),
+            y_divider_top_1=np.array(y_divider_top_1, dtype=np.float32),
+            y_divider_top_2=np.array(y_divider_top_2, dtype=np.float32),
+            y_top_outer=np.array(y_top_outer, dtype=np.float32),
             ego_length=np.array(ego_length, dtype=np.float32),
             ego_width=np.array(ego_width, dtype=np.float32),
             obs_length=np.array(ego_length, dtype=np.float32),

@@ -433,7 +433,7 @@ def run_episode(ctrl, kind, obs_csv, times, params, run_seed):
 
 def main():
     ap = argparse.ArgumentParser()
-    default_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", "features_dir2_5_10s.csv")
+    default_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", "obstacle_data.csv")
     ap.add_argument("--csv", type=str, default=default_csv, help="Path to obstacle CSV")
     ap.add_argument("--runs", type=int, default=30)
     ap.add_argument("--outdir", type=str, default="results_mppi_stats_paper")

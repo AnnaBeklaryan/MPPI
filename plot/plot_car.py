@@ -43,6 +43,9 @@ def _replay_method(method: str, data: dict, root_dir: str) -> None:
     y_bottom = float(data["y_bottom"])
     y_top = float(data["y_top"])
     y_divider = float(data["y_divider"])
+    y_divider_top_1 = float(data["y_divider_top_1"]) if "y_divider_top_1" in data else None
+    y_divider_top_2 = float(data["y_divider_top_2"]) if "y_divider_top_2" in data else None
+    y_top_outer = float(data["y_top_outer"]) if "y_top_outer" in data else None
     ego_length = float(data["ego_length"])
     ego_width = float(data["ego_width"])
     obs_length = float(data["obs_length"])
@@ -91,8 +94,13 @@ def _replay_method(method: str, data: dict, root_dir: str) -> None:
     ax.set_ylabel("y [scaled m]")
 
     ax.axhline(y_bottom, color="white", linewidth=3.0, zorder=2)
-    ax.axhline(y_top, color="white", linewidth=3.0, zorder=2)
     ax.axhline(y_divider, color="white", linewidth=2.0, linestyle=(0, (12, 12)), alpha=0.9, zorder=2)
+    if y_top_outer is not None and y_divider_top_1 is not None and y_divider_top_2 is not None:
+        ax.axhline(y_divider_top_1, color="white", linewidth=2.0, linestyle=(0, (12, 12)), alpha=0.9, zorder=2)
+        ax.axhline(y_divider_top_2, color="white", linewidth=2.0, linestyle=(0, (12, 12)), alpha=0.9, zorder=2)
+        ax.axhline(y_top_outer, color="white", linewidth=3.0, zorder=2)
+    else:
+        ax.axhline(y_top, color="white", linewidth=3.0, zorder=2)
 
     ax.plot([x_path[0, 0] - 100, x_path[0, 0] + 500], [lane_y, lane_y],
             "--", linewidth=1.5, color="#abbac6", alpha=0.8, label="Lane center")

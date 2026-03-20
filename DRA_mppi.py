@@ -416,7 +416,7 @@ if __name__ == "__main__":
     np.random.seed(3)
 
     base_dir = os.path.dirname(__file__)
-    csv_path = os.path.join(base_dir, "Data/features_dir2_5_10s.csv")
+    csv_path = os.path.join(base_dir, "Data/obstacle_data.csv")
 
     pos_scale = 0.10
     vel_scale = 0.10
@@ -436,7 +436,7 @@ if __name__ == "__main__":
     if not (np.isfinite(dt) and dt > 0):
         raise ValueError(f"Invalid dt computed from CSV: dt={dt}")
 
-    # Core controller params matched to mppi_1.py
+    # MPPI params matched to MPPI/DRA_mppi.py
     T = 10
     M = 1200
     lam = 2.0
@@ -449,7 +449,7 @@ if __name__ == "__main__":
     R = np.array([1e-5, 1e-5], dtype=np.float32)
 
     sigma_cp = 0.05
-    Nmc = 20000
+    Nmc = 2000
     omega_soft = 10.0
     omega_hard = 1000.0
     obs_pos_sigma = (0.25 * pos_scale, 0.25 * pos_scale)
@@ -489,6 +489,9 @@ if __name__ == "__main__":
     y_divider = ROAD_CENTER
     y_bottom = ROAD_CENTER - LANE_W
     y_top = ROAD_CENTER + LANE_W
+    y_divider_top_1 = y_top
+    y_divider_top_2 = y_top + LANE_W
+    y_top_outer = y_top + 2.0 * LANE_W
     lane_y = y_divider + 0.5 * LANE_W
 
     x_mppi = np.array([0.0, lane_y, 0.0], dtype=np.float32)
@@ -600,7 +603,7 @@ if __name__ == "__main__":
         mppi.U_cpu = mppi.U
 
         xlim_hist[k, :] = [float(x_mppi[0] - 9.0), float(x_mppi[0] + 9.0)]
-        ylim_hist[k, :] = [float(lane_y - 2.0), float(lane_y + 2.0)]
+        ylim_hist[k, :] = [float(y_bottom - 0.2), float(y_top_outer + 0.2)]
 
         X_hist[k, :] = x_mppi
         X_path[k + 1, :] = x_mppi[:2]
@@ -625,6 +628,9 @@ if __name__ == "__main__":
             y_bottom=np.array(y_bottom, dtype=np.float32),
             y_top=np.array(y_top, dtype=np.float32),
             y_divider=np.array(y_divider, dtype=np.float32),
+            y_divider_top_1=np.array(y_divider_top_1, dtype=np.float32),
+            y_divider_top_2=np.array(y_divider_top_2, dtype=np.float32),
+            y_top_outer=np.array(y_top_outer, dtype=np.float32),
             ego_length=np.array(ego_length, dtype=np.float32),
             ego_width=np.array(ego_width, dtype=np.float32),
             obs_length=np.array(obs_length, dtype=np.float32),

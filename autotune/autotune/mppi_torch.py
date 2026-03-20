@@ -439,7 +439,7 @@ if __name__ == "__main__":
     np.random.seed(3)
 
     here = os.path.dirname(__file__)
-    csv_path = os.path.join(here, "features_dir2_5_10s.csv")
+    csv_path = os.path.join(here, "obstacle_data.csv")
 
     pos_scale = 0.10
     vel_scale = 0.10
@@ -506,6 +506,9 @@ if __name__ == "__main__":
     y_divider = ROAD_CENTER
     y_bottom  = ROAD_CENTER - LANE_W
     y_top     = ROAD_CENTER + LANE_W
+    y_divider_top_1 = y_top
+    y_divider_top_2 = y_top + LANE_W
+    y_top_outer = y_top + 2.0 * LANE_W
     lane_y = y_divider + 0.5 * LANE_W
 
     x_mppi = np.array([0.0, lane_y, 0.0], dtype=np.float32)
@@ -545,9 +548,13 @@ if __name__ == "__main__":
     ax.set_ylabel("y [scaled m]")
 
     ax.axhline(y_bottom,  color="white", linewidth=3.0, zorder=2)
-    ax.axhline(y_top,     color="white", linewidth=3.0, zorder=2)
     ax.axhline(y_divider, color="white", linewidth=2.0, linestyle=(0, (12, 12)),
                alpha=0.9, zorder=2)
+    ax.axhline(y_divider_top_1, color="white", linewidth=2.0, linestyle=(0, (12, 12)),
+               alpha=0.9, zorder=2)
+    ax.axhline(y_divider_top_2, color="white", linewidth=2.0, linestyle=(0, (12, 12)),
+               alpha=0.9, zorder=2)
+    ax.axhline(y_top_outer, color="white", linewidth=3.0, zorder=2)
 
     ax.plot([x_mppi[0] - 100, x_mppi[0] + 500], [lane_y, lane_y],
             "--", linewidth=1.5, color="#abbac6", alpha=0.8, label="Lane center")
@@ -717,8 +724,8 @@ if __name__ == "__main__":
 
         x_left  = float(x_mppi[0] - CAM_X_BEHIND)
         x_right = float(x_mppi[0] + CAM_X_AHEAD)
-        y_low   = float(lane_y - CAM_Y_HALF)
-        y_high  = float(lane_y + CAM_Y_HALF)
+        y_low   = float(y_bottom - 0.2)
+        y_high  = float(y_top_outer + 0.2)
 
         if np.isfinite(x_left) and np.isfinite(x_right) and np.isfinite(y_low) and np.isfinite(y_high):
             ax.set_xlim(x_left, x_right)
