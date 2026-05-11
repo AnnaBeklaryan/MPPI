@@ -80,7 +80,13 @@ def yaw_follow_from_vel(v: np.ndarray, fallback: float) -> float:
     return float(np.arctan2(vy, vx))
 
 
-def build_ref_and_obs_seq(traj, moving_traj, t_now: float, dt: float, T: int, lead_time: float, last_yaw_ref: float):
+def _as_moving_traj_list(moving_trajs) -> list:
+    if isinstance(moving_trajs, (list, tuple)):
+        return list(moving_trajs)
+    return [moving_trajs]
+
+
+def build_ref_and_obs_seq(traj, moving_trajs, t_now: float, dt: float, T: int, lead_time: float, last_yaw_ref: float):
     ref_seq = np.zeros((T + 1, 4), dtype=float)
 
     p0, v0 = traj.eval(min(t_now, traj.total_time))
@@ -96,11 +102,21 @@ def build_ref_and_obs_seq(traj, moving_traj, t_now: float, dt: float, T: int, le
         ref_seq[k, 0:3] = pk
         ref_seq[k, 3] = prev + wrap_pi(psi_raw - prev)
 
-    obs_seq = np.zeros((T + 1, 3), dtype=float)
-    for k in range(T + 1):
-        tk = min(moving_traj.total_time, t_now + lead_time + k * dt)
-        op, _ = moving_traj.eval(tk)
-        obs_seq[k] = op
+    moving_traj_list = _as_moving_traj_list(moving_trajs)
+    if len(moving_traj_list) == 1:
+        obs_seq = np.zeros((T + 1, 3), dtype=float)
+        moving_traj = moving_traj_list[0]
+        for k in range(T + 1):
+            tk = min(moving_traj.total_time, t_now + lead_time + k * dt)
+            op, _ = moving_traj.eval(tk)
+            obs_seq[k] = op
+    else:
+        obs_seq = np.zeros((T + 1, len(moving_traj_list), 3), dtype=float)
+        for j, moving_traj in enumerate(moving_traj_list):
+            for k in range(T + 1):
+                tk = min(moving_traj.total_time, t_now + lead_time + k * dt)
+                op, _ = moving_traj.eval(tk)
+                obs_seq[k, j] = op
 
     return ref_seq, obs_seq, float(ref_seq[1, 3])
 
@@ -118,7 +134,6 @@ def effective_control_weight(ctrl) -> np.ndarray:
         sigma = np.asarray(sigma, dtype=float).reshape(-1)
         if sigma.shape == (4,):
             return 1.0 / np.maximum(sigma ** 2, 1e-12)
-
     if hasattr(ctrl, "R_np"):
         return np.asarray(ctrl.R_np, dtype=float).reshape(4,)
     if hasattr(ctrl, "R"):
@@ -194,9 +209,12 @@ def closest_distance_and_events(
 ) -> tuple[float, bool, bool]:
     p = x[0:3]
 
-    d_move = float(np.linalg.norm(p - obs_pos))
-    move_safety = d_move < (moving_r + drone_r + safety_margin)
-    move_collision = d_move < (moving_r + drone_r)
+    obs_pos = np.asarray(obs_pos, dtype=float)
+    obs_points = obs_pos.reshape(1, 3) if obs_pos.ndim == 1 else obs_pos.reshape(-1, 3)
+    move_dists = np.linalg.norm(obs_points - p[None, :], axis=1)
+    d_move = float(np.min(move_dists))
+    move_safety = bool(np.any(move_dists < (moving_r + drone_r + safety_margin)))
+    move_collision = bool(np.any(move_dists < (moving_r + drone_r)))
 
     d_cyl_min = np.inf
     cyl_safety = False
@@ -434,7 +452,7 @@ def run_episode(
     ctrl,
     kind: str,
     traj,
-    moving_traj,
+    moving_trajs,
     cylinders,
     Q,
     Qf,
@@ -465,7 +483,7 @@ def run_episode(
         t_now = k * dt
         ref_seq, obs_seq, last_yaw_ref = build_ref_and_obs_seq(
             traj=traj,
-            moving_traj=moving_traj,
+            moving_trajs=moving_trajs,
             t_now=t_now,
             dt=dt,
             T=int(ctrl.T),
@@ -511,23 +529,76 @@ def run_episode(
 
 
 def main():
+    dr_reference = dr_mod.DRParams(
+        dt=0.03,
+        horizon_steps=35,
+        rollouts=1096,
+        lam=2,
+        ang_max=np.deg2rad(28.533048677493525),
+        yawrate_max=np.deg2rad(125.002671219858),
+        tau_phi=0.22445102088241203,
+        tau_theta=0.19182828711184713,
+        phi_rate_max=np.deg2rad(186.91775798517736),
+        theta_rate_max=np.deg2rad(250.74834372828798),
+        sigma=np.array(
+            [
+                0.03860791271607059,
+                np.deg2rad(6.072834867326699),
+                np.deg2rad(7.139534744261536),
+                np.deg2rad(9.50181217517332),
+            ],
+            dtype=np.float32,
+        ),
+        w_cyl=510.6988597095838,
+        cyl_safety_margin=0.2150292356967072,
+        cyl_alpha=8.72155294537059,
+        w_moving=376.5800114691624,
+        moving_r=0.3045201563139591,
+        moving_safety_margin=0.4224283788684363,
+        moving_alpha=15.033309531167399,
+        cvar_alpha=0.7790712559865822,
+        cvar_N=48,
+        obs_pos_sigma_xy=(0.1569012991377936, 0.18206816632027703),
+        noise_mode="per_step",
+        dr_eps_cvar=0.030026822645753973,
+        drone_radius=0.3662153322325755,
+        R_u=(2, 2, 2, 1),
+        Rd_u=(2, 2, 2, 1),
+    )
+    dr_reference_lead_time = 1.5495997771078638
+    dr_reference_q = np.array([121.54191793531642, 120.7320008579965, 143.93311001418877, 0.0], dtype=float)
+    dr_reference_qf = np.array(
+        [
+            4.24444323202221 * 121.54191793531642,
+            2.2842848307817354 * 120.7320008579965,
+            3.7565634665191308 * 143.93311001418877,
+            0.0,
+        ],
+        dtype=float,
+    )
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--outdir", type=str, default="results_crazyflie_stats_paper")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--steps", type=int, default=550)
-    ap.add_argument("--alpha", type=float, default=0.95, help="CVaR alpha for RA/DR")
+    ap.add_argument("--alpha", type=float, default=float(dr_reference.cvar_alpha), help="CVaR alpha for RA/DR")
     ap.add_argument("--use_gpu", action="store_true")
-    ap.add_argument("--dr_eps_cvar", type=float, default=0.02)
+    ap.add_argument("--dr_eps_cvar", type=float, default=float(dr_reference.dr_eps_cvar))
     args = ap.parse_args()
 
-    horizon = 60
-    rollouts = 1024
-    iterations = 2
-    lead_time = 1.0
-    cvar_n = 64
-    obs_noise_mode = "static"
-    obs_sigma_xyz = (0.25, 0.25, 0.25)
+    dt = float(dr_reference.dt)
+    horizon = int(dr_reference.horizon_steps)
+    rollouts = int(dr_reference.rollouts)
+    lead_time = float(dr_reference_lead_time)
+    cvar_n = int(dr_reference.cvar_N)
+    obs_noise_mode = str(dr_reference.noise_mode)
+    # DR uses XY obstacle uncertainty; the benchmark's DRA controller needs XYZ, so mirror Y onto Z.
+    obs_sigma_xyz = (
+        float(dr_reference.obs_pos_sigma_xy[0]),
+        float(dr_reference.obs_pos_sigma_xy[1]),
+        float(dr_reference.obs_pos_sigma_xy[1]),
+    )
     extra_margin = 0.0
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -553,6 +624,25 @@ def main():
         [2.5, 2.0, 0.0],
     ], dtype=float)
 
+    # waypoints_2 = np.array([
+    #     [ 2.5,  2.0, 0.0],
+    #     [-1.0, -2., 2.0],
+    #     [ -3.,  -2., 4.0],
+    #     [ -3.,  1.7, 3.5],
+    #     [ -3.,  1.7, 3.],
+    #     [ -0.2,  -1.7, 0.9],
+    #     [ 1.3,  -2.9, 0.9],
+    #     [ 3.3,  -1.6, 0.8],
+    #     [ 2.5,  2.0, 0.0],
+    # ], dtype=float)
+    waypoints_2 = np.array([
+        [ 2.5,  2.0, 0.0],
+        [-2.0, -2.5, 3.0],
+        [ 0.0,  3.5, 2.0],
+        [ 3.0,  0.0, 0.5],
+        [ 2.5,  2.0, 0.0],
+    ], dtype=float)
+
     cylinders = [
         {"cx": 0.5, "cy": 1.0, "r": 0.6, "zmin": 0.0, "zmax": 4.5},
         {"cx": -1.8, "cy": -0.5, "r": 0.7, "zmin": 0.0, "zmax": 5.0},
@@ -561,30 +651,38 @@ def main():
     ]
 
     traj = plain_mod.build_min_snap_3d(waypoints, avg_speed=1.8)
-    moving_traj = plain_mod.build_min_snap_3d(waypoints_1 + np.array([0.40, -0.30, 0.00], dtype=float), avg_speed=1.8)
+    moving_trajs = [
+        plain_mod.build_min_snap_3d(waypoints_1, avg_speed=1.8),
+        plain_mod.build_min_snap_3d(waypoints_2, avg_speed=1.8),
+    ]
 
-    dt = 0.02
-    steps = min(int(args.steps), int(max(traj.total_time, moving_traj.total_time) / dt) + 1)
+    steps = min(int(args.steps), int(max([traj.total_time] + [mt.total_time for mt in moving_trajs]) / dt) + 1)
 
-    Q = np.array([30.0, 30.0, 40.0, 0.0], dtype=float)
-    Qf = np.array([120.0, 120.0, 160.0, 0.0], dtype=float)
+    Q = dr_reference_q.copy()
+    Qf = dr_reference_qf.copy()
     _ = Qf  # kept for parity with controller APIs
 
     mass = 0.028
     g = 9.81
-    hover = mass * g
-    common_sigma = np.array([0.15 * hover, np.deg2rad(6.0), np.deg2rad(6.0), np.deg2rad(30.0)], dtype=float)
+    common_sigma = np.asarray(dr_reference.sigma, dtype=float).copy()
 
     common_plain = dict(
         dt=dt,
         horizon_steps=int(horizon),
         rollouts=int(rollouts),
-        iterations=int(iterations),
-        lam=1.0,
+        lam=float(dr_reference.lam),
         sigma=common_sigma.copy(),
-        w_cyl=350.0,
-        cyl_safety_margin=0.25,
-        cyl_alpha=10.0,
+        R_u=tuple(float(v) for v in dr_reference.R_u),
+        ang_max=float(dr_reference.ang_max),
+        yawrate_max=float(dr_reference.yawrate_max),
+        tau_phi=float(dr_reference.tau_phi),
+        tau_theta=float(dr_reference.tau_theta),
+        phi_rate_max=float(dr_reference.phi_rate_max),
+        theta_rate_max=float(dr_reference.theta_rate_max),
+        w_cyl=float(dr_reference.w_cyl),
+        cyl_safety_margin=float(dr_reference.cyl_safety_margin),
+        cyl_alpha=float(dr_reference.cyl_alpha),
+        Rd_u=tuple(float(v) for v in dr_reference.Rd_u),
     )
 
     alg_specs = [
@@ -605,13 +703,13 @@ def main():
         if spec["kind"] == "plain":
             p = plain_mod.MPPIParams(
                 **common_plain,
-                w_moving=1200.0,
-                moving_r=0.35,
-                moving_safety_margin=0.50,
-                moving_alpha=12.0,
+                w_moving=float(dr_reference.w_moving),
+                moving_r=float(dr_reference.moving_r),
+                moving_safety_margin=float(dr_reference.moving_safety_margin),
+                moving_alpha=float(dr_reference.moving_alpha),
             )
             ctrl = plain_mod.TorchMPPIQuadOuter(mass=mass, g=g, params=p, cylinders=cylinders, device=device)
-            drone_radius = 0.25
+            drone_radius = float(dr_reference.drone_radius)
             R_eval = effective_control_weight(ctrl)
 
         elif spec["kind"] == "ra":
@@ -619,20 +717,27 @@ def main():
                 dt=dt,
                 horizon_steps=int(horizon),
                 rollouts=int(rollouts),
-                iterations=int(iterations),
-                lam=1.0,
-                w_cyl=350.0,
-                cyl_margin=0.25,
-                cyl_alpha=10.0,
-                w_moving_soft=1200.0,
-                moving_r=0.35,
-                moving_margin=0.50,
-                moving_alpha=12.0,
-                drone_radius=0.25,
+                lam=float(dr_reference.lam),
+                ang_max=float(dr_reference.ang_max),
+                yawrate_max=float(dr_reference.yawrate_max),
+                tau_phi=float(dr_reference.tau_phi),
+                tau_theta=float(dr_reference.tau_theta),
+                phi_rate_max=float(dr_reference.phi_rate_max),
+                theta_rate_max=float(dr_reference.theta_rate_max),
+                w_cyl=float(dr_reference.w_cyl),
+                cyl_margin=float(dr_reference.cyl_safety_margin),
+                cyl_alpha=float(dr_reference.cyl_alpha),
+                w_moving_soft=float(dr_reference.w_moving),
+                moving_r=float(dr_reference.moving_r),
+                moving_margin=float(dr_reference.moving_safety_margin),
+                moving_alpha=float(dr_reference.moving_alpha),
+                drone_radius=float(dr_reference.drone_radius),
                 cvar_alpha=float(args.alpha),
                 cvar_N=int(cvar_n),
-                obs_pos_sigma_xy=tuple(float(v) for v in obs_sigma_xyz[:2]),
+                obs_pos_sigma_xy=tuple(float(v) for v in dr_reference.obs_pos_sigma_xy),
                 obs_noise_mode=str(obs_noise_mode),
+                R_u=tuple(float(v) for v in dr_reference.R_u),
+                Rd_u=tuple(float(v) for v in dr_reference.Rd_u),
             )
             ctrl = ra_mod.TorchRAQuad(mass=mass, g=g, params=p, cylinders=cylinders, device=device)
             drone_radius = float(p.drone_radius)
@@ -643,25 +748,32 @@ def main():
                 dt=dt,
                 horizon_steps=int(horizon),
                 rollouts=int(rollouts),
-                iterations=int(iterations),
-                lam=1.0,
+                lam=float(dr_reference.lam),
+                ang_max=float(dr_reference.ang_max),
+                yawrate_max=float(dr_reference.yawrate_max),
+                tau_phi=float(dr_reference.tau_phi),
+                tau_theta=float(dr_reference.tau_theta),
+                phi_rate_max=float(dr_reference.phi_rate_max),
+                theta_rate_max=float(dr_reference.theta_rate_max),
                 sigma=common_sigma.copy(),
-                w_cyl=350.0,
-                cyl_safety_margin=0.25,
-                cyl_alpha=10.0,
-                w_moving=1200.0,
-                moving_r=0.35,
-                moving_safety_margin=0.50,
-                moving_alpha=12.0,
+                w_cyl=float(dr_reference.w_cyl),
+                cyl_safety_margin=float(dr_reference.cyl_safety_margin),
+                cyl_alpha=float(dr_reference.cyl_alpha),
+                w_moving=float(dr_reference.w_moving),
+                moving_r=float(dr_reference.moving_r),
+                moving_safety_margin=float(dr_reference.moving_safety_margin),
+                moving_alpha=float(dr_reference.moving_alpha),
                 cvar_alpha=float(args.alpha),
                 cvar_N=int(cvar_n),
-                obs_pos_sigma_xy=tuple(float(v) for v in obs_sigma_xyz[:2]),
+                obs_pos_sigma_xy=tuple(float(v) for v in dr_reference.obs_pos_sigma_xy),
                 noise_mode=str(obs_noise_mode),
                 dr_eps_cvar=float(args.dr_eps_cvar),
-                drone_radius=0.25,
+                drone_radius=float(dr_reference.drone_radius),
+                R_u=tuple(float(v) for v in dr_reference.R_u),
+                Rd_u=tuple(float(v) for v in dr_reference.Rd_u),
             )
             ctrl = dr_mod.TorchDRMPPIQuadOuter(mass=mass, g=g, params=p, cylinders=cylinders, device=device)
-            drone_radius = 0.25
+            drone_radius = float(p.drone_radius)
             R_eval = effective_control_weight(ctrl)
 
         elif spec["kind"] == "dra":
@@ -669,15 +781,20 @@ def main():
                 dt=dt,
                 horizon_steps=int(horizon),
                 rollouts=int(rollouts),
-                iterations=int(iterations),
-                lam=1.0,
-                w_cyl=350.0,
-                cyl_safety_margin=0.25,
-                cyl_alpha=10.0,
-                w_moving=1200.0,
-                moving_r=0.35,
-                moving_safety_margin=0.50,
-                moving_alpha=12.0,
+                lam=float(dr_reference.lam),
+                ang_max=float(dr_reference.ang_max),
+                yawrate_max=float(dr_reference.yawrate_max),
+                tau_phi=float(dr_reference.tau_phi),
+                tau_theta=float(dr_reference.tau_theta),
+                phi_rate_max=float(dr_reference.phi_rate_max),
+                theta_rate_max=float(dr_reference.theta_rate_max),
+                w_cyl=float(dr_reference.w_cyl),
+                cyl_safety_margin=float(dr_reference.cyl_safety_margin),
+                cyl_alpha=float(dr_reference.cyl_alpha),
+                w_moving=float(dr_reference.w_moving),
+                moving_r=float(dr_reference.moving_r),
+                moving_safety_margin=float(dr_reference.moving_safety_margin),
+                moving_alpha=float(dr_reference.moving_alpha),
                 sigma_cp=0.05,
                 Nmc=1200,
                 omega_soft=10.0,
@@ -685,7 +802,9 @@ def main():
                 sigma=common_sigma.copy(),
                 obs_pos_sigma_xyz=tuple(float(v) for v in obs_sigma_xyz),
                 mc_chunk=256,
-                drone_radius=0.25,
+                drone_radius=float(dr_reference.drone_radius),
+                R_u=tuple(float(v) for v in dr_reference.R_u),
+                Rd_u=tuple(float(v) for v in dr_reference.Rd_u),
             )
             ctrl = dra_mod.TorchDRAMPPIQuadOuter(mass=mass, g=g, params=p, cylinders=cylinders, device=device)
             drone_radius = float(p.drone_radius)
@@ -719,7 +838,7 @@ def main():
                 ctrl=ctrl,
                 kind=spec["kind"],
                 traj=traj,
-                moving_traj=moving_traj,
+                moving_trajs=moving_trajs,
                 cylinders=cylinders,
                 Q=Q,
                 Qf=Qf,

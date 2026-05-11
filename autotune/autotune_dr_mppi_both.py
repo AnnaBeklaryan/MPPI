@@ -52,7 +52,6 @@ def sample_tracking_cfg(rng: random.Random) -> dict:
     return {
         "T": rng.choice([15, 20, 25, 30]),
         "M": rng.choice([512, 768, 1024, 1200]),
-        "I": rng.choice([1, 2]),
         "lam": rng.uniform(0.01, 0.30),
         "sigma_v": rng.uniform(0.2, 1.6),
         "sigma_w_deg": rng.uniform(4.0, 35.0),
@@ -122,7 +121,6 @@ def _build_controller(cfg: dict, risk: dict, dt: float, device: str):
         terminal_cost=terminal_cost_track,
         device=device,
         dtype=torch.float32,
-        I=int(cfg["I"]),
         cvar_alpha=float(risk["cvar_alpha"]),
         cvar_N=int(risk["cvar_N"]),
         obs_pos_sigma=(float(risk["obs_pos_sigma"][0]), float(risk["obs_pos_sigma"][1])),

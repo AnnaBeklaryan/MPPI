@@ -165,7 +165,6 @@ def rollout_cost(env_factory, spec: TuneSpec, x, steps: int, device):
         device=device,
         dyn_kwargs=dict(w_max=float(np.deg2rad(180.0))),
         cost_kwargs=dict(ref=None, Q=None, R=None, Qf=None, O_mean=None, radii=None, obs_w=5e3),
-        I=1,
         verbose=False,
     )
 

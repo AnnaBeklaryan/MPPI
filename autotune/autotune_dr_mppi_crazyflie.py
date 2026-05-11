@@ -7,7 +7,6 @@ This tuner is intentionally constrained for your use case:
     dt=0.02
     horizon_steps=35
     rollouts=1000
-    iterations=1
 - DR risk parameters are NOT tuned and remain at DRParams defaults
 - objective prioritizes path tracking quality, then final convergence, then smoothness
 
@@ -44,7 +43,6 @@ from DR_mppi_crazyflie import DRParams, TorchDRMPPIQuadOuter, build_min_snap_3d 
 FIXED_DT = 0.02
 FIXED_HORIZON_STEPS = 35
 FIXED_ROLLOUTS = 1000
-FIXED_ITERATIONS = 1
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -162,7 +160,6 @@ def build_controller(cfg: dict, cylinders, device: str):
         dt=FIXED_DT,
         horizon_steps=FIXED_HORIZON_STEPS,
         rollouts=FIXED_ROLLOUTS,
-        iterations=FIXED_ITERATIONS,
         lam=float(cfg["lam"]),
         ang_max=math.radians(float(cfg["ang_max_deg"])),
         yawrate_max=math.radians(float(cfg["yawrate_max_deg"])),
@@ -369,8 +366,7 @@ def main():
     print("Tuned keys:", ", ".join(tuned_keys))
     print(
         "Fixed planner params:",
-        f"dt={FIXED_DT}, horizon_steps={FIXED_HORIZON_STEPS}, "
-        f"rollouts={FIXED_ROLLOUTS}, iterations={FIXED_ITERATIONS}",
+        f"dt={FIXED_DT}, horizon_steps={FIXED_HORIZON_STEPS}, rollouts={FIXED_ROLLOUTS}",
     )
     print("Risk params: kept at DRParams defaults in DR_mppi_crazyflie.py")
 
@@ -400,7 +396,6 @@ def main():
             "dt": FIXED_DT,
             "horizon_steps": FIXED_HORIZON_STEPS,
             "rollouts": FIXED_ROLLOUTS,
-            "iterations": FIXED_ITERATIONS,
         },
         "risk_params_policy": "Kept at DRParams defaults; not part of the search space.",
         "notes": "Use best_cfg for tracking weights, smoothing, dynamics limits, sampling noise, and lead_time only.",

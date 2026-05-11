@@ -55,7 +55,6 @@ def sample_cfg(rng: random.Random):
         # planner / rollout
         "T": rng.choice([15, 20, 25, 30, 35]),
         "M": rng.choice([512, 768, 1024, 1200, 1536]),
-        "I": rng.choice([1, 2]),
         "lam": rng.uniform(0.005, 0.25),
         # control noise for MPPI sampling
         "sigma_v": rng.uniform(0.2, 1.6),
@@ -116,7 +115,6 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
         terminal_cost=terminal_cost_track,
         device=device,
         dtype=torch.float32,
-        I=int(cfg["I"]),
         # fixed DR params
         cvar_alpha=FIXED_CVAR_ALPHA,
         cvar_N=FIXED_CVAR_N,

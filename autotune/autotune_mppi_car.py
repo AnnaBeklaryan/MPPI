@@ -41,7 +41,6 @@ def sample_cfg(rng: random.Random):
     return {
         "T": rng.choice([15, 20, 25, 30, 35]),
         "M": rng.choice([512, 768, 1024, 1200, 1536]),
-        "I": rng.choice([1, 2, 3]),
         "lam": rng.uniform(0.01, 0.30),
         "sigma_v": rng.uniform(0.2, 1.8),
         "sigma_w_deg": rng.uniform(3.0, 35.0),
@@ -98,7 +97,6 @@ def evaluate_cfg(cfg, obs_csv: MovingObstacleCSV, pos_scale: float, max_steps: i
         terminal_cost=terminal_cost_track,
         device=device,
         dtype=torch.float32,
-        I=int(cfg["I"]),
         dyn_kwargs=dict(w_max=dyn_w_max),
         cost_kwargs=dict(ref=None, Q=None, R=None, Qf=None, O_mean=None, radii=None, obs_w=float(cfg["obs_w"])),
         verbose=False,

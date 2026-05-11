@@ -1,0 +1,174 @@
+{
+  "profile": "tracking_plus_dr_risk_only",
+  "best_score": 16.81637249534755,
+  "best_cfg": {
+    "lam": 1.8533889501553538,
+    "sigma_T_ratio": 0.11842035799245153,
+    "sigma_phi_deg": 6.617475184942621,
+    "sigma_theta_deg": 5.057499381066807,
+    "sigma_yawrate_deg": 12.961177990155708,
+    "R_T": 572.8695638103289,
+    "R_roll": 22.79273409154459,
+    "R_pitch": 448.19673355341496,
+    "R_yaw": 16.02731278026731,
+    "Rd_T": 0.7668425118818228,
+    "Rd_roll": 2.915684019063937,
+    "Rd_pitch": 1.3092306258403374,
+    "Rd_yaw": 0.13635613724195011,
+    "Qx": 73.96227705956949,
+    "Qy": 149.15646006303894,
+    "Qz": 154.86961442492358,
+    "Qf_x_scale": 1.8166651698576861,
+    "Qf_y_scale": 3.6570419333627595,
+    "Qf_z_scale": 3.1355181684401545,
+    "lead_time": 1.59542851496128,
+    "cvar_alpha": 0.9331169711493086,
+    "cvar_N": 96,
+    "obs_sigma_x": 0.1433284897328007,
+    "obs_sigma_y": 0.31851934658303727,
+    "noise_mode": "per_step",
+    "dr_eps_cvar": 0.039551896244934034
+  },
+  "best_metrics": {
+    "rmse_pos": 1.222319741581151,
+    "rmse_yaw": 1.7395524735734151,
+    "final_pos_error": 2.366310111885991,
+    "max_pos_error": 2.3813853907871865,
+    "du_rms_roll_pitch": 0.34864915917974887,
+    "mean_solve_ms": 24.36590973111305,
+    "safety_violation_rate": 0.05582655826558266,
+    "collision_rate": 0.0,
+    "safety_shortfall_mean": 0.005953437557746375,
+    "collision_shortfall_mean": 0.0,
+    "min_clearance_across_scenarios": 0.08817230982937208,
+    "min_safety_clearance_across_scenarios": -0.16182769017062792,
+    "steps": 615,
+    "scenario_names": [
+      "moving_a",
+      "moving_b",
+      "moving_pair"
+    ],
+    "scenario_scores": [
+      16.6731989411459,
+      15.458772485735919,
+      17.390197681511456
+    ],
+    "mean_score": 16.507389702797756,
+    "worst_score": 17.390197681511456
+  },
+  "best_payload_for_dr_mppi_crazyflie": {
+    "dr_params": {
+      "dt": 0.02,
+      "horizon_steps": 35,
+      "rollouts": 1000,
+      "lam": 1.8533889501553538,
+      "sigma": [
+        0.03252770393336659,
+        0.11549673014626942,
+        0.08827001611719115,
+        0.2262152308652383
+      ],
+      "R_u": [
+        572.8695638103289,
+        22.79273409154459,
+        448.19673355341496,
+        16.02731278026731
+      ],
+      "Rd_u": [
+        0.7668425118818228,
+        2.915684019063937,
+        1.3092306258403374,
+        0.13635613724195011
+      ],
+      "cvar_alpha": 0.9331169711493086,
+      "cvar_N": 96,
+      "obs_pos_sigma_xy": [
+        0.1433284897328007,
+        0.31851934658303727
+      ],
+      "noise_mode": "per_step",
+      "dr_eps_cvar": 0.039551896244934034
+    },
+    "Q": [
+      73.96227705956949,
+      149.15646006303894,
+      154.86961442492358,
+      0.0
+    ],
+    "Qf": [
+      134.36469261748405,
+      545.4714290824811,
+      485.5964897686693,
+      0.0
+    ],
+    "lead_time": 1.59542851496128
+  },
+  "tuned_keys": [
+    "Qf_x_scale",
+    "Qf_y_scale",
+    "Qf_z_scale",
+    "Qx",
+    "Qy",
+    "Qz",
+    "R_T",
+    "R_pitch",
+    "R_roll",
+    "R_yaw",
+    "Rd_T",
+    "Rd_pitch",
+    "Rd_roll",
+    "Rd_yaw",
+    "cvar_N",
+    "cvar_alpha",
+    "dr_eps_cvar",
+    "lam",
+    "lead_time",
+    "noise_mode",
+    "obs_sigma_x",
+    "obs_sigma_y",
+    "sigma_T_ratio",
+    "sigma_phi_deg",
+    "sigma_theta_deg",
+    "sigma_yawrate_deg"
+  ],
+  "fixed_planner_params": {
+    "dt": 0.02,
+    "horizon_steps": 35,
+    "rollouts": 1000
+  },
+  "fixed_policy": {
+    "tracking_terms_tuned": [
+      "lam",
+      "sigma",
+      "R_u",
+      "Rd_u",
+      "Q",
+      "Qf",
+      "lead_time"
+    ],
+    "dr_risk_terms_tuned": [
+      "cvar_alpha",
+      "cvar_N",
+      "obs_pos_sigma_xy",
+      "noise_mode",
+      "dr_eps_cvar"
+    ],
+    "left_at_drparams_defaults": [
+      "ang_max",
+      "yawrate_max",
+      "tau_phi",
+      "tau_theta",
+      "phi_rate_max",
+      "theta_rate_max",
+      "w_cyl",
+      "cyl_safety_margin",
+      "cyl_alpha",
+      "w_moving",
+      "moving_r",
+      "moving_safety_margin",
+      "moving_alpha",
+      "drone_radius"
+    ]
+  },
+  "notes": "Objective mixes tracking quality with strong safety penalties so DR-risk terms stay meaningful. Scenario suite includes each moving obstacle separately plus a paired-obstacle case."
+}

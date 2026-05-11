@@ -215,7 +215,6 @@ class MPPI_Torch_Generic:
         dynamics: Callable[..., Tensor],
         running_cost: Callable[..., Tensor],
         terminal_cost: Callable[..., Tensor],
-        I: int = 1,
         exp_clip: float = 80.0,
         weight_floor: float = 1e-12,
         device: Optional[Union[str, torch.device]] = None,
@@ -230,7 +229,6 @@ class MPPI_Torch_Generic:
         self.T = int(T)
         self.M = int(M)
         self.lam = float(lam)
-        self.I = int(I)
         self.verbose = bool(verbose)
 
         if not (np.isfinite(self.dt) and self.dt > 0):
@@ -344,73 +342,71 @@ class MPPI_Torch_Generic:
             ns = 0
             sample_idx = None
 
-        for it in range(self.I):
-            # eps
-            if eps is None:
-                eps_t = self._sample_eps(generator=None)
+        # eps
+        if eps is None:
+            eps_t = self._sample_eps(generator=None)
+        else:
+            if isinstance(eps, torch.Tensor):
+                z = eps.to(device=self.device, dtype=self.dtype)
             else:
-                if isinstance(eps, torch.Tensor):
-                    z = eps.to(device=self.device, dtype=self.dtype)
-                else:
-                    z = torch.as_tensor(np.asarray(eps, dtype=np.float32), device=self.device, dtype=self.dtype)
-                if z.shape != (self.M, self.T, self.nu):
-                    raise ValueError(f"eps must be (M,T,nu)={(self.M,self.T,self.nu)}, got {tuple(z.shape)}")
-                if self.noise_mode == "diag":
-                    eps_t = z * self.noise_std
-                else:
-                    eps_t = z @ self.noise_L.T
+                z = torch.as_tensor(np.asarray(eps, dtype=np.float32), device=self.device, dtype=self.dtype)
+            if z.shape != (self.M, self.T, self.nu):
+                raise ValueError(f"eps must be (M,T,nu)={(self.M,self.T,self.nu)}, got {tuple(z.shape)}")
+            if self.noise_mode == "diag":
+                eps_t = z * self.noise_std
+            else:
+                eps_t = z @ self.noise_L.T
 
-            J = torch.zeros((self.M,), device=self.device, dtype=self.dtype)
-            X = x0_t.unsqueeze(0).repeat(self.M, 1)
+        J = torch.zeros((self.M,), device=self.device, dtype=self.dtype)
+        X = x0_t.unsqueeze(0).repeat(self.M, 1)
+
+        if return_samples:
+            X_hist = torch.zeros((self.T + 1, ns, nx), device=self.device, dtype=self.dtype)
+            X_hist[0] = X.index_select(0, sample_idx)
+        else:
+            X_hist = None
+
+        for t in range(self.T):
+            U_t = torch.clamp(U[t].unsqueeze(0) + eps_t[:, t, :], self.u_min, self.u_max)
+
+            X = self.dynamics(X, U_t, self.dt, **self.dyn_kwargs)
+            if X.shape != (self.M, nx):
+                raise ValueError(f"dynamics must return (M,nx)={(self.M,nx)}, got {tuple(X.shape)}")
 
             if return_samples:
-                X_hist = torch.zeros((self.T + 1, ns, nx), device=self.device, dtype=self.dtype)
-                X_hist[0] = X.index_select(0, sample_idx)
-            else:
-                X_hist = None
+                X_hist[t + 1] = X.index_select(0, sample_idx)
 
-            for t in range(self.T):
-                U_t = torch.clamp(U[t].unsqueeze(0) + eps_t[:, t, :], self.u_min, self.u_max)
+            c = self.running_cost(X, U_t, t, **self.cost_kwargs)
+            if c.shape != (self.M,):
+                raise ValueError(f"running_cost must return (M,), got {tuple(c.shape)}")
+            J = J + c
 
-                X = self.dynamics(X, U_t, self.dt, **self.dyn_kwargs)
-                if X.shape != (self.M, nx):
-                    raise ValueError(f"dynamics must return (M,nx)={(self.M,nx)}, got {tuple(X.shape)}")
+            if self.perturbation_cost != 0.0:
+                J = J + self.perturbation_cost * torch.sum(eps_t[:, t, :] ** 2, dim=1)
 
-                if return_samples:
-                    X_hist[t + 1] = X.index_select(0, sample_idx)
+        ct = self.terminal_cost(X, self.T, **self.cost_kwargs)
+        if ct.shape != (self.M,):
+            raise ValueError(f"terminal_cost must return (M,), got {tuple(ct.shape)}")
+        J = J + ct
 
-                c = self.running_cost(X, U_t, t, **self.cost_kwargs)
-                if c.shape != (self.M,):
-                    raise ValueError(f"running_cost must return (M,), got {tuple(c.shape)}")
-                J = J + c
+        J = torch.nan_to_num(
+            J,
+            nan=torch.tensor(float("inf"), device=self.device, dtype=self.dtype),
+            posinf=torch.tensor(float("inf"), device=self.device, dtype=self.dtype),
+            neginf=torch.tensor(float("inf"), device=self.device, dtype=self.dtype),
+        )
 
-                if self.perturbation_cost != 0.0:
-                    J = J + self.perturbation_cost * torch.sum(eps_t[:, t, :] ** 2, dim=1)
+        rho = torch.min(J)
+        z = -(J - rho) / self.lam
+        z = torch.clamp(z, -self.exp_clip, self.exp_clip)
+        w = torch.exp(z)
+        w_sum = torch.sum(w)
+        w_sum_val = float(w_sum.item())
 
-            ct = self.terminal_cost(X, self.T, **self.cost_kwargs)
-            if ct.shape != (self.M,):
-                raise ValueError(f"terminal_cost must return (M,), got {tuple(ct.shape)}")
-            J = J + ct
-
-            J = torch.nan_to_num(
-                J,
-                nan=torch.tensor(float("inf"), device=self.device, dtype=self.dtype),
-                posinf=torch.tensor(float("inf"), device=self.device, dtype=self.dtype),
-                neginf=torch.tensor(float("inf"), device=self.device, dtype=self.dtype),
-            )
-
-            rho = torch.min(J)
-            z = -(J - rho) / self.lam
-            z = torch.clamp(z, -self.exp_clip, self.exp_clip)
-            w = torch.exp(z)
-            w_sum = torch.sum(w)
-            w_sum_val = float(w_sum.item())
-
-            if (not np.isfinite(w_sum_val)) or (w_sum_val < self.weight_floor):
-                if self.verbose:
-                    print(f"[WARN] weight collapse at iter {it}: w_sum={w_sum_val}")
-                continue
-
+        if (not np.isfinite(w_sum_val)) or (w_sum_val < self.weight_floor):
+            if self.verbose:
+                print(f"[WARN] weight collapse: w_sum={w_sum_val}")
+        else:
             w = w / w_sum
 
             for t in range(self.T):
@@ -485,7 +481,6 @@ if __name__ == "__main__":
             ref=None, Q=None, R=None, Qf=None,
             O_mean=None, radii=None, obs_w=5e3
         ),
-        I=1,
         verbose=False
     )
 

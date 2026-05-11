@@ -40,7 +40,6 @@ class MPPI:
         dynamics: Callable[..., Tensor],
         running_cost: Callable[..., Tensor],
         terminal_cost: Callable[..., Tensor],
-        I: int = 1,
         exp_clip: float = 80.0,
         weight_floor: float = 1e-12,
         device: Optional[Union[str, torch.device]] = None,
@@ -54,7 +53,6 @@ class MPPI:
         self.T = int(T)
         self.M = int(M)
         self.lam = float(lam)
-        self.I = int(I)
         self.verbose = bool(verbose)
 
         if not (np.isfinite(self.dt) and self.dt > 0):
@@ -142,41 +140,40 @@ class MPPI:
             ns = 0
             sample_idx = None
 
-        for it in range(self.I):
-            eps = self._sample_eps()
-            J = torch.zeros((self.M,), device=self.device, dtype=self.dtype)
+        eps = self._sample_eps()
+        J = torch.zeros((self.M,), device=self.device, dtype=self.dtype)
 
-            X = x0_t.unsqueeze(0).repeat(self.M, 1)
+        X = x0_t.unsqueeze(0).repeat(self.M, 1)
+
+        if return_samples:
+            Xsamp = torch.zeros((self.T + 1, ns, nx), device=self.device, dtype=self.dtype)
+            Xsamp[0] = X.index_select(0, sample_idx)
+        else:
+            Xsamp = None
+
+        for t in range(self.T):
+            U_t = torch.clamp(U[t].unsqueeze(0) + eps[:, t, :], self.u_min, self.u_max)
+            X = self.dynamics(X, U_t, self.dt, **self.dyn_kwargs)
+
+            c = self.running_cost(X, U_t, t, **self.cost_kwargs)
+            J = J + c
 
             if return_samples:
-                Xsamp = torch.zeros((self.T + 1, ns, nx), device=self.device, dtype=self.dtype)
-                Xsamp[0] = X.index_select(0, sample_idx)
-            else:
-                Xsamp = None
+                Xsamp[t + 1] = X.index_select(0, sample_idx)
 
-            for t in range(self.T):
-                U_t = torch.clamp(U[t].unsqueeze(0) + eps[:, t, :], self.u_min, self.u_max)
-                X = self.dynamics(X, U_t, self.dt, **self.dyn_kwargs)
+        J = J + self.terminal_cost(X, self.T, **self.cost_kwargs)
+        J = torch.nan_to_num(J, nan=torch.tensor(float("inf"), device=self.device, dtype=self.dtype))
 
-                c = self.running_cost(X, U_t, t, **self.cost_kwargs)
-                J = J + c
+        rho = torch.min(J)
+        z = -(J - rho) / self.lam
+        z = torch.clamp(z, -self.exp_clip, self.exp_clip)
+        w = torch.exp(z)
 
-                if return_samples:
-                    Xsamp[t + 1] = X.index_select(0, sample_idx)
-
-            J = J + self.terminal_cost(X, self.T, **self.cost_kwargs)
-            J = torch.nan_to_num(J, nan=torch.tensor(float("inf"), device=self.device, dtype=self.dtype))
-
-            rho = torch.min(J)
-            z = -(J - rho) / self.lam
-            z = torch.clamp(z, -self.exp_clip, self.exp_clip)
-            w = torch.exp(z)
-
-            w_sum = torch.sum(w)
-            if float(w_sum.item()) < self.weight_floor:
-                if self.verbose:
-                    print(f"[WARN] weight collapse it={it}, w_sum={float(w_sum.item())}")
-                continue
+        w_sum = torch.sum(w)
+        if float(w_sum.item()) < self.weight_floor:
+            if self.verbose:
+                print(f"[WARN] weight collapse, w_sum={float(w_sum.item())}")
+        else:
             w = w / w_sum
 
             for t in range(self.T):
@@ -223,6 +220,8 @@ class RA_MPPI(MPPI):
         cvar_N: int = 64,
         obs_pos_sigma: Union[Tuple[float, float], np.ndarray, Tensor] = (0.25, 0.25),
         obs_noise_mode: str = "static",  # "static" or "per_step"
+        risk_cost_A: float = 0.0,
+        risk_cost_Cu: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -236,6 +235,10 @@ class RA_MPPI(MPPI):
             raise ValueError("obs_noise_mode must be 'static' or 'per_step'")
 
         self.obs_pos_sigma = _as_torch(obs_pos_sigma, self.device, self.dtype).reshape(2)
+        self.risk_cost_A = float(risk_cost_A)
+        self.risk_cost_Cu = float(risk_cost_Cu)
+        if self.risk_cost_A < 0.0:
+            raise ValueError("risk_cost_A must be >= 0")
 
     def _sample_obstacles(
         self,
@@ -361,65 +364,69 @@ class RA_MPPI(MPPI):
 
         debug = {}
 
-        for it in range(self.I):
-            eps = self._sample_eps()
-            J = torch.zeros((self.M,), device=self.device, dtype=self.dtype)
+        eps = self._sample_eps()
+        J = torch.zeros((self.M,), device=self.device, dtype=self.dtype)
 
-            X = x0_t.unsqueeze(0).repeat(self.M, 1)
-            X_hist_xy = torch.zeros((self.T, self.M, 2), device=self.device, dtype=self.dtype)
+        X = x0_t.unsqueeze(0).repeat(self.M, 1)
+        X_hist_xy = torch.zeros((self.T, self.M, 2), device=self.device, dtype=self.dtype)
+
+        if return_samples:
+            nx = int(x0_t.numel())
+            Xsamp = torch.zeros((self.T + 1, ns, nx), device=self.device, dtype=self.dtype)
+            Xsamp[0] = X.index_select(0, sample_idx)
+        else:
+            Xsamp = None
+
+        for t in range(self.T):
+            U_t = torch.clamp(U[t].unsqueeze(0) + eps[:, t, :], self.u_min, self.u_max)
+            X = self.dynamics(X, U_t, self.dt, **self.dyn_kwargs)
+            X_hist_xy[t] = X[:, :2]
+
+            c = self.running_cost(X, U_t, t, **self.cost_kwargs)
+            J = J + c
 
             if return_samples:
-                nx = int(x0_t.numel())
-                Xsamp = torch.zeros((self.T + 1, ns, nx), device=self.device, dtype=self.dtype)
-                Xsamp[0] = X.index_select(0, sample_idx)
-            else:
-                Xsamp = None
+                Xsamp[t + 1] = X.index_select(0, sample_idx)
 
-            for t in range(self.T):
-                U_t = torch.clamp(U[t].unsqueeze(0) + eps[:, t, :], self.u_min, self.u_max)
-                X = self.dynamics(X, U_t, self.dt, **self.dyn_kwargs)
-                X_hist_xy[t] = X[:, :2]
+        J = J + self.terminal_cost(X, self.T, **self.cost_kwargs)
+        J = torch.nan_to_num(J, nan=torch.tensor(float("inf"), device=self.device, dtype=self.dtype))
 
-                c = self.running_cost(X, U_t, t, **self.cost_kwargs)
-                J = J + c
+        feasible, cvar_max = self.cvar_feasible_mask(X_hist_xy, O_mean, radii, obs_noise_std=obs_noise_std)
+        risk_penalty = torch.zeros_like(J)
+        if self.risk_cost_A > 0.0:
+            risk_mask = cvar_max > self.risk_cost_Cu
+            risk_penalty[risk_mask] = self.risk_cost_A * cvar_max[risk_mask]
+        J_total = J + risk_penalty
 
-                if return_samples:
-                    Xsamp[t + 1] = X.index_select(0, sample_idx)
+        if not bool(torch.any(feasible).item()):
+            best = int(torch.argmin(J_total).item())
+            feasible = torch.zeros_like(feasible)
+            feasible[best] = True
 
-            J = J + self.terminal_cost(X, self.T, **self.cost_kwargs)
-            J = torch.nan_to_num(J, nan=torch.tensor(float("inf"), device=self.device, dtype=self.dtype))
+        Jf = J_total[feasible]
+        rho = torch.min(Jf)
 
-            feasible, cvar_max = self.cvar_feasible_mask(X_hist_xy, O_mean, radii, obs_noise_std=obs_noise_std)
+        w = torch.zeros_like(J_total)
+        w[feasible] = torch.exp(-(Jf - rho) / self.lam)
 
-            if not bool(torch.any(feasible).item()):
-                best = int(torch.argmin(cvar_max).item())
-                feasible = torch.zeros_like(feasible)
-                feasible[best] = True
+        w_sum = torch.sum(w)
+        w_sum_val = float(w_sum.item())
+        feas_count = int(torch.sum(feasible).item())
 
-            Jf = J[feasible]
-            rho = torch.min(Jf)
+        debug = {
+            "feasible_count": feas_count,
+            "w_sum": w_sum_val,
+            "cvar_min": float(torch.min(cvar_max).item()),
+            "cvar_med": float(torch.median(cvar_max).item()),
+            "cvar_max": float(torch.max(cvar_max).item()),
+            "risk_cost_max": float(torch.max(risk_penalty).item()),
+            "risk_cost_mean": float(torch.mean(risk_penalty).item()),
+        }
 
-            w = torch.zeros_like(J)
-            w[feasible] = torch.exp(-(Jf - rho) / self.lam)
-
-            w_sum = torch.sum(w)
-            w_sum_val = float(w_sum.item())
-            feas_count = int(torch.sum(feasible).item())
-
-            debug = {
-                "it": it,
-                "feasible_count": feas_count,
-                "w_sum": w_sum_val,
-                "cvar_min": float(torch.min(cvar_max).item()),
-                "cvar_med": float(torch.median(cvar_max).item()),
-                "cvar_max": float(torch.max(cvar_max).item()),
-            }
-
-            if (not np.isfinite(w_sum_val)) or (w_sum_val < self.weight_floor):
-                if self.verbose:
-                    print(f"[WARN] weight collapse it={it}: {debug}")
-                continue
-
+        if (not np.isfinite(w_sum_val)) or (w_sum_val < self.weight_floor):
+            if self.verbose:
+                print(f"[WARN] weight collapse: {debug}")
+        else:
             w = w / w_sum
 
             for t in range(self.T):

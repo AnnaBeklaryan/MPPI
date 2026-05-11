@@ -6,13 +6,14 @@ Algorithms (table columns):
 - MPPI
 - RAMPPI
 - DRMPPI
+- DRAMPPI
 
 Row metrics:
 1) Global minimum of per-run minimum distance to obstacles
 2) Mean ± std of per-run minimum distance
 3) Safety violation probability using threshold (r + r_s)
 4) Collision probability using threshold (r)
-5) Mean ± std of total trajectory stage cost (Q and Sigma^-2 only; no terminal cost)
+5) Mean ± std of total trajectory stage cost (Q and R only; no terminal cost)
 6) Global maximum of per-run maximum compute time
 7) Mean ± std of per-run maximum compute time
 
@@ -287,11 +288,14 @@ def make_three_plots(metric_key: str, title_root: str, x_label: str, per_alg: di
     )
 
 
-def run_episode(ctrl, kind, obs_csv, times, params, run_seed):
+def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
     dt = params["dt"]
     steps = params["steps"]
-
-    x = np.array([0.0, params["lane_y"], 0.0], dtype=np.float32)
+    scenario = int(params["scenario"])
+    x = np.asarray(params["x0"], dtype=np.float32).copy()
+    ref_nearest_idx = int(params.get("ref_nearest_idx0", 0))
+    obs_update_steps = int(params["obs_update_steps"])
+    obs_update_dt = params["obs_update_dt"]
 
     total_qr_cost = 0.0
     min_dists = []
@@ -302,19 +306,50 @@ def run_episode(ctrl, kind, obs_csv, times, params, run_seed):
     safety_threshold = float(params["ego_radius"] + params["obs_radius"] + params["eval_extra_margin"])
     collision_threshold = float(params["ego_radius"] + params["obs_radius"])
     planning_R = float(params["ego_radius"] + params["obs_radius"] + params["plan_extra_margin"])
+    held_obs_df = None
+    held_obs_t = float("nan")
+    last_obs_update_k = -10**9
+    next_obs_update_t = float(sim_time_grid[0])
 
     if kind != "dra":
         Q_t = torch.as_tensor(params["Q"], device=ctrl.device, dtype=ctrl.dtype)
         R_t = torch.as_tensor(params["R"], device=ctrl.device, dtype=ctrl.dtype)
         Qf_t = torch.as_tensor(params["Qf"], device=ctrl.device, dtype=ctrl.dtype)
+        y_min_t = torch.as_tensor(params["y_min_bound"], device=ctrl.device, dtype=ctrl.dtype)
+        y_max_t = torch.as_tensor(params["y_max_bound"], device=ctrl.device, dtype=ctrl.dtype)
+        path_xy_t = None
+        if scenario == 2 and params["ref_path_xypsi"] is not None:
+            path_xy_t = torch.as_tensor(
+                params["ref_path_xypsi"][:, :2],
+                device=ctrl.device,
+                dtype=ctrl.dtype,
+            )
 
     for k in range(steps):
-        t_now = float(times[k])
-        obs_now = obs_csv.obstacles_now(t_now)
+        t_now = float(sim_time_grid[k])
+
+        if obs_update_dt is None:
+            need_fresh_obs = (held_obs_df is None) or ((k - last_obs_update_k) >= obs_update_steps)
+        else:
+            need_fresh_obs = (held_obs_df is None) or (t_now + 1e-9 >= next_obs_update_t)
+
+        if need_fresh_obs:
+            held_obs_df = obs_csv.obstacles_now(t_now)
+            held_obs_t = float(obs_csv.nearest_time(t_now))
+            last_obs_update_k = k
+
+            if obs_update_dt is not None:
+                while next_obs_update_t <= t_now + 1e-9:
+                    next_obs_update_t += obs_update_dt
+
+        obs_now = held_obs_df.copy()
 
         dx = obs_now["x"].to_numpy(float) - float(x[0])
         dy = obs_now["y"].to_numpy(float) - float(x[1])
-        mask = (dx > -params["x_behind"]) & (dx < params["x_ahead"] + 10.0) & (np.abs(dy) < (params["y_halfspan"] + 2.0))
+        if scenario == 1:
+            mask = (dx > -params["x_behind"]) & (dx < params["x_ahead"] + 10.0) & (np.abs(dy) < (params["y_halfspan"] + 2.0))
+        else:
+            mask = (dx * dx + dy * dy) < float(9.5**2)
         obs_now = obs_now[mask].copy()
 
         if len(obs_now) > 0:
@@ -332,13 +367,39 @@ def run_episode(ctrl, kind, obs_csv, times, params, run_seed):
         else:
             radii_for_mppi = np.array([], dtype=np.float32)
 
-        ref = np.array([float(x[0]) + params["L_ref"], params["lane_y"], params["lane_psi"]], dtype=np.float32)
+        if scenario == 1:
+            ref = np.array([float(x[0]) + params["L_ref"], params["lane_y"], params["lane_psi"]], dtype=np.float32)
+        else:
+            ref, ref_nearest_idx, _ref_target_idx = plain_mod.reference_from_path(
+                x_now=x,
+                path_xypsi=params["ref_path_xypsi"],
+                path_s=params["ref_path_s"],
+                lookahead_dist=params["L_ref"],
+                last_nearest_idx=ref_nearest_idx,
+            )
+            ref = np.asarray(ref, dtype=np.float32)
 
         if kind != "dra":
             ctrl.cost_kwargs["ref"] = torch.as_tensor(ref, device=ctrl.device, dtype=ctrl.dtype)
             ctrl.cost_kwargs["Q"] = Q_t
             ctrl.cost_kwargs["R"] = R_t
             ctrl.cost_kwargs["Qf"] = Qf_t
+            ctrl.cost_kwargs["y_min"] = y_min_t
+            ctrl.cost_kwargs["y_max"] = y_max_t
+            ctrl.cost_kwargs["boundary_w"] = params["boundary_w"]
+            ctrl.cost_kwargs["boundary_k"] = params["boundary_k"]
+            ctrl.cost_kwargs["boundary_d"] = params["boundary_d"]
+            if scenario == 2 and path_xy_t is not None:
+                ctrl.cost_kwargs["path_xy"] = path_xy_t
+                ctrl.cost_kwargs["path_boundary_w"] = params["path_boundary_w"]
+                ctrl.cost_kwargs["path_boundary_k"] = params["path_boundary_k"]
+                ctrl.cost_kwargs["path_corridor_radius"] = params["path_corridor_radius"]
+            else:
+                ctrl.cost_kwargs["path_xy"] = None
+                ctrl.cost_kwargs["path_boundary_w"] = 0.0
+                ctrl.cost_kwargs["path_boundary_k"] = params["path_boundary_k"]
+                ctrl.cost_kwargs["path_corridor_radius"] = params["path_corridor_radius"]
+            ctrl.cost_kwargs["obs_w"] = params["plain_obs_w"] if kind == "plain" else 0.0
             if K > 0:
                 ctrl.cost_kwargs["O_mean"] = torch.as_tensor(O_mean, device=ctrl.device, dtype=ctrl.dtype)
                 ctrl.cost_kwargs["radii"] = torch.as_tensor(radii_for_mppi, device=ctrl.device, dtype=ctrl.dtype)
@@ -381,11 +442,17 @@ def run_episode(ctrl, kind, obs_csv, times, params, run_seed):
         u0 = U[0].astype(np.float32).copy()
         u0[0] = np.clip(params["u_blend_v"] * u0[0] + (1.0 - params["u_blend_v"]) * params["v_des"], 0.0, float(params["u_max"][0]))
 
-        # Q + Sigma^-2 stage cost only (terminal excluded by design).
+        # Q + R stage cost only (terminal excluded by design).
         total_qr_cost += eval_stage_cost(x, u0, ref, params["Q"], params["R"])
 
         if kind == "plain":
-            x = plain_mod.diffdrive_dynamics(x, u0, dt, v_max=float(params["u_max"][0])).astype(np.float32)
+            x = plain_mod.diffdrive_dynamics_cpu(
+                x,
+                u0,
+                dt,
+                v_max=float(params["u_max"][0]),
+                w_max=float(params["dyn_w_max"]),
+            ).astype(np.float32)
         elif kind in ("ra", "dr"):
             x = ra_mod.diffdrive_dynamics_cpu(
                 x,
@@ -407,7 +474,7 @@ def run_episode(ctrl, kind, obs_csv, times, params, run_seed):
 
         # Distance evaluated at the next timestamp.
         k_next = min(k + 1, steps - 1)
-        t_next = float(times[k_next])
+        t_next = float(sim_time_grid[k_next])
         obs_xy_eval = all_obstacles_xy(obs_csv, t_next)
         dmin = min_dist_to_obstacles(x[:2], obs_xy_eval)
         min_dists.append(dmin)
@@ -433,17 +500,50 @@ def run_episode(ctrl, kind, obs_csv, times, params, run_seed):
 
 def main():
     ap = argparse.ArgumentParser()
-    default_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", "obstacle_data.csv")
-    ap.add_argument("--csv", type=str, default=default_csv, help="Path to obstacle CSV")
+    ap.add_argument("--scenario", type=int, choices=[1, 2], default=1, help="Scenario 1 uses the straight-road setup; scenario 2 uses the roundabout setup.")
+    ap.add_argument("--csv", type=str, default="", help="Optional override path to obstacle CSV. If omitted, the file is chosen from --scenario.")
     ap.add_argument("--runs", type=int, default=30)
     ap.add_argument("--outdir", type=str, default="results_mppi_stats_paper")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--steps", type=int, default=900)
     ap.add_argument("--alpha", type=float, default=0.95, help="CVaR alpha used for both RA and DR MPPI")
     ap.add_argument("--use_gpu", action="store_true")
+    ap.add_argument(
+        "--obs-update-steps",
+        type=int,
+        default=20,
+        help=(
+            "Read a fresh obstacle CSV sample every N control steps and hold that "
+            "same obstacle observation between reads. Control dt is unchanged."
+        ),
+    )
+    ap.add_argument(
+        "--obs-update-dt",
+        type=float,
+        default=None,
+        help=(
+            "Optional observation update period in seconds. When set, this overrides "
+            "--obs-update-steps and uses the nearest available control tick, so control "
+            "dt is still unchanged."
+        ),
+    )
+    ap.add_argument(
+        "--extra-sim-time",
+        type=float,
+        default=8.0,
+        help=(
+            "Optional extra simulation time in seconds after the last CSV timestamp. "
+            "Beyond the CSV range, the last available obstacle sample is held."
+        ),
+    )
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
+
+    scenario = int(args.scenario)
+    default_csv_name = "obstacle_data.csv" if scenario == 1 else "obstacle_data_2.csv"
+    default_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", default_csv_name)
+    csv_path = args.csv if args.csv else default_csv
 
     pos_scale = 0.10
     vel_scale = 0.10
@@ -451,7 +551,7 @@ def main():
     y_offset = 23.0
 
     obs_csv = plain_mod.MovingObstacleCSV(
-        csv_path=args.csv,
+        csv_path=csv_path,
         x_offset=0.0,
         y_offset=y_offset,
         pos_scale=pos_scale,
@@ -460,43 +560,105 @@ def main():
     )
 
     dt = float(np.round(np.min(np.diff(obs_csv.times)), 6))
-    times = obs_csv.times
-    steps = min(args.steps, len(times))
+    if not (np.isfinite(dt) and dt > 0):
+        raise ValueError(f"Invalid dt computed from CSV: dt={dt}")
 
-    T = 10
-    M = 150
+    obs_update_steps = max(1, int(args.obs_update_steps))
+    obs_update_dt = None if args.obs_update_dt is None else float(args.obs_update_dt)
+    extra_sim_time = float(args.extra_sim_time)
+    if obs_update_dt is not None and not (np.isfinite(obs_update_dt) and obs_update_dt > 0.0):
+        raise ValueError(f"--obs-update-dt must be positive, got {args.obs_update_dt}")
+    if not (np.isfinite(extra_sim_time) and extra_sim_time >= 0.0):
+        raise ValueError(f"--extra-sim-time must be >= 0, got {args.extra_sim_time}")
+
+    csv_t_start = float(obs_csv.times[0])
+    csv_t_end = float(obs_csv.times[-1])
+    sim_steps_total = max(
+        len(obs_csv.times),
+        int(np.ceil((csv_t_end + extra_sim_time - csv_t_start) / dt - 1e-9)) + 1,
+    )
+    sim_time_grid = csv_t_start + dt * np.arange(sim_steps_total, dtype=float)
+    steps = min(args.steps, len(sim_time_grid))
+    sim_time_grid = sim_time_grid[:steps]
+
+    # Mirror the current parameter blocks from mppi.py / RA_mppi.py / DR_mppi.py / DRA_mppi.py.
+    T = 20
+    M = 1200
     lam = 2.0
     sigma = np.array([2.0, 1.04], dtype=np.float32)
     u_min = np.array([0.0, -np.deg2rad(180.0)], dtype=np.float32)
-    u_max = np.array([10.0, np.deg2rad(180.0)], dtype=np.float32)
+    u_max = np.array([5.0, np.deg2rad(180.0)], dtype=np.float32)
 
-    Q = np.array([0.001, 0.001, 0.001], dtype=np.float32)
-    Qf = np.array([0.5, 10.0, 1.0], dtype=np.float32)
-    R = (1.0 / np.maximum(sigma ** 2, 1e-12)).astype(np.float32)
+    Q = np.array([0.001, 0.01, 0.001], dtype=np.float32)
+    Qf = np.array([0.5, 50.0, 1.0], dtype=np.float32)
+    R = np.array([0.004, 0.004], dtype=np.float32)
+    cvar_N = 10
+    ra_dr_obs_pos_sigma = (0.07, 0.07)
+    dr_eps_cvar = 0.038
+    obs_noise_mode = "per_step"
+    risk_cost_A = 10.0
+    risk_cost_Cu = 0.0
+    plain_obs_w = 5e3
+    dra_sigma_cp = 0.05
+    dra_Nmc = 2000
+    dra_omega_soft = 10.0
+    dra_omega_hard = 1000.0
+    dra_obs_pos_sigma = (0.015, 0.015)
+    dra_mc_chunk = 1000
 
     lane_psi = 0.0
-    L_ref = 14.0
-    v_des = 7.0
-    u_blend_v = 0.9
+    L_ref = 5.0
+    v_des = 5.0
+    u_blend_v = 1.0
 
     ROAD_CENTER = 1.0
-    LANE_W = 0.70
+    LANE_W = 0.80
+    y_divider = ROAD_CENTER
+    y_bottom = ROAD_CENTER - LANE_W
+    y_top = ROAD_CENTER + LANE_W
+    y_divider_top_1 = ROAD_CENTER + LANE_W
+    y_divider_top_2 = y_divider_top_1 + LANE_W
+    y_top_outer = y_top + 2.0 * LANE_W
     lane_y = ROAD_CENTER + 0.5 * LANE_W
+    y_min_bound = 0.0
+    y_max_bound = y_divider_top_1
+    boundary_w = 500.0
+    boundary_k = 50.0
+    boundary_d = 0.05
+    path_boundary_w = 0.0
+    path_boundary_k = 35.0
+    path_corridor_radius = 0.45
 
     ego_length = 4.5 * pos_scale
     ego_width = 1.8 * pos_scale
     ego_radius = 0.5 * np.sqrt(ego_length**2 + ego_width**2)
     obs_radius = ego_radius
 
-    # r_s term in (r + r_s) safety threshold.
-    plan_extra_margin = 0.03
-    eval_extra_margin = 0.26
+    plan_extra_margin = 0.0
+    eval_extra_margin = 0.0
+
+    ref_path_xypsi = None
+    ref_path_s = None
+    ref_nearest_idx0 = 0
+    x0 = np.array([0.0, lane_y, 0.0], dtype=np.float32)
+    if scenario == 2:
+        roundabout_center_x = 6.1
+        roundabout_center_y = lane_y
+        L_ref = 1.6
+        v_des = 2.8
+        boundary_w = 0.0
+        path_boundary_w = 300.0
+        ref_waypoints_xy = plain_mod.build_roundabout_waypoints(roundabout_center_x, roundabout_center_y)
+        ref_path_xypsi, ref_path_s = plain_mod.build_path_from_waypoints(ref_waypoints_xy, ds=0.05)
+        x0 = ref_path_xypsi[0].astype(np.float32)
 
     params = dict(
+        scenario=scenario,
         dt=dt,
         steps=steps,
         T=T,
         M=M,
+        x0=x0,
         lane_y=lane_y,
         lane_psi=lane_psi,
         L_ref=L_ref,
@@ -508,23 +670,62 @@ def main():
         Q=Q,
         R=R,
         Qf=Qf,
+        plain_obs_w=plain_obs_w,
         ego_radius=ego_radius,
         obs_radius=obs_radius,
+        y_bottom=y_bottom,
+        y_top=y_top,
+        y_divider=y_divider,
+        y_divider_top_1=y_divider_top_1,
+        y_divider_top_2=y_divider_top_2,
+        y_top_outer=y_top_outer,
+        y_min_bound=y_min_bound,
+        y_max_bound=y_max_bound,
+        boundary_w=boundary_w,
+        boundary_k=boundary_k,
+        boundary_d=boundary_d,
+        path_boundary_w=path_boundary_w,
+        path_boundary_k=path_boundary_k,
+        path_corridor_radius=path_corridor_radius,
+        ref_path_xypsi=ref_path_xypsi,
+        ref_path_s=ref_path_s,
+        ref_nearest_idx0=ref_nearest_idx0,
         plan_extra_margin=plan_extra_margin,
         eval_extra_margin=eval_extra_margin,
-        x_ahead=6.0,
+        x_ahead=18.0,
         x_behind=4.0,
         y_halfspan=2.8,
         max_obs_draw=20,
-        dyn_w_max=np.deg2rad(234.08634709537696),
+        dyn_w_max=np.deg2rad(180.0),
+        obs_update_steps=obs_update_steps,
+        obs_update_dt=obs_update_dt,
     )
 
     device = "cuda" if (args.use_gpu and torch.cuda.is_available()) else "cpu"
     print(
-        f"[setup] csv={args.csv}, requested_gpu={int(bool(args.use_gpu))}, "
+        f"[setup] scenario={scenario}, csv={csv_path}, requested_gpu={int(bool(args.use_gpu))}, "
         f"torch_cuda_available={int(bool(torch.cuda.is_available()))}, device={device}",
         flush=True,
     )
+    if obs_update_dt is None:
+        print(
+            f"[OBS] control_dt={dt:.6f} s | fresh CSV obstacle read every "
+            f"{obs_update_steps} control step(s) = {obs_update_steps * dt:.6f} s; held between reads",
+            flush=True,
+        )
+    else:
+        print(
+            f"[OBS] control_dt={dt:.6f} s | requested fresh CSV obstacle read period "
+            f"{obs_update_dt:.6f} s; using nearest control tick and holding between reads",
+            flush=True,
+        )
+    print(
+        f"[SIM] csv_time_range=[{csv_t_start:.3f}, {csv_t_end:.3f}] s | "
+        f"run_time_range=[{sim_time_grid[0]:.3f}, {sim_time_grid[-1]:.3f}] s",
+        flush=True,
+    )
+    if sim_time_grid[-1] > csv_t_end + 1e-9:
+        print("[SIM] past the last CSV timestamp, the last available obstacle sample is held.", flush=True)
     common_kwargs = dict(
         dt=dt,
         T=T,
@@ -533,12 +734,28 @@ def main():
         noise_sigma=sigma,
         u_min=u_min,
         u_max=u_max,
-        I=1,
         device=device,
         dtype=torch.float32,
         verbose=False,
         dyn_kwargs=dict(w_max=float(params["dyn_w_max"])),
-        cost_kwargs=dict(ref=None, Q=None, R=None, Qf=None, O_mean=None, radii=None, obs_w=0.0),
+        cost_kwargs=dict(
+            ref=None,
+            Q=None,
+            R=None,
+            Qf=None,
+            O_mean=None,
+            radii=None,
+            obs_w=0.0,
+            y_min=None,
+            y_max=None,
+            boundary_w=0.0,
+            boundary_k=boundary_k,
+            boundary_d=boundary_d,
+            path_xy=None,
+            path_corridor_radius=path_corridor_radius,
+            path_boundary_w=0.0,
+            path_boundary_k=path_boundary_k,
+        ),
     )
 
     alg_specs = [
@@ -563,9 +780,11 @@ def main():
                 running_cost=ra_mod.running_cost_lane_obs,
                 terminal_cost=ra_mod.terminal_cost_track,
                 cvar_alpha=float(args.alpha),
-                cvar_N=6,
-                obs_pos_sigma=(0.06, 0.10),
-                obs_noise_mode="per_step",
+                cvar_N=cvar_N,
+                obs_pos_sigma=ra_dr_obs_pos_sigma,
+                obs_noise_mode=obs_noise_mode,
+                risk_cost_A=risk_cost_A,
+                risk_cost_Cu=risk_cost_Cu,
                 **common_kwargs,
             )
         elif spec["kind"] == "dr":
@@ -574,10 +793,12 @@ def main():
                 running_cost=dr_mod.running_cost_lane_obs,
                 terminal_cost=dr_mod.terminal_cost_track,
                 cvar_alpha=float(args.alpha),
-                cvar_N=6,
-                obs_pos_sigma=(0.06, 0.10),
-                obs_noise_mode="per_step",
-                dr_eps_cvar=0.05,
+                cvar_N=cvar_N,
+                obs_pos_sigma=ra_dr_obs_pos_sigma,
+                obs_noise_mode=obs_noise_mode,
+                dr_eps_cvar=dr_eps_cvar,
+                risk_cost_A=risk_cost_A,
+                risk_cost_Cu=risk_cost_Cu,
                 **common_kwargs,
             )
         elif spec["kind"] == "dra":
@@ -592,17 +813,29 @@ def main():
                 Qf=Qf,
                 u_min=u_min,
                 u_max=u_max,
-                I=1,
-                sigma_cp=0.05,
-                Nmc=400,
-                omega_soft=10.0,
-                omega_hard=1000.0,
-                obs_pos_sigma=(0.06, 0.10),
-                mc_chunk=50,
+                sigma_cp=dra_sigma_cp,
+                Nmc=dra_Nmc,
+                omega_soft=dra_omega_soft,
+                omega_hard=dra_omega_hard,
+                obs_pos_sigma=dra_obs_pos_sigma,
+                mc_chunk=dra_mc_chunk,
                 seed=int(args.seed),
                 device=device,
                 dtype=torch.float32,
             )
+            ctrl.y_min = torch.as_tensor(y_min_bound, device=ctrl.device, dtype=ctrl.dtype)
+            ctrl.y_max = torch.as_tensor(y_max_bound, device=ctrl.device, dtype=ctrl.dtype)
+            ctrl.boundary_w = boundary_w
+            ctrl.boundary_k = boundary_k
+            ctrl.boundary_d = boundary_d
+            ctrl._boundary_w_t = torch.as_tensor(boundary_w, device=ctrl.device, dtype=ctrl.dtype)
+            ctrl.path_xy = None
+            ctrl.path_boundary_w = 0.0
+            ctrl.path_boundary_k = path_boundary_k
+            ctrl.path_corridor_radius = path_corridor_radius
+            if scenario == 2 and ref_path_xypsi is not None:
+                ctrl.path_xy = torch.as_tensor(ref_path_xypsi[:, :2], device=ctrl.device, dtype=ctrl.dtype)
+                ctrl.path_boundary_w = path_boundary_w
         else:
             raise RuntimeError("Unknown controller spec")
         controllers.append((spec, ctrl))
@@ -633,7 +866,7 @@ def main():
                 ctrl=ctrl,
                 kind=spec["kind"],
                 obs_csv=obs_csv,
-                times=times,
+                sim_time_grid=sim_time_grid,
                 params=params,
                 run_seed=run_seed,
             )
@@ -668,6 +901,7 @@ def main():
                     RunMinDistance=rec["run_min_dist"][i],
                     SafetyViolation=rec["safety_violation"][i],
                     Collision=rec["collision"][i],
+                    # Keep legacy column name for compatibility with existing plot scripts.
                     TotalQSigmaInvStageCost=rec["total_qr_cost"][i],
                     RunMaxComputeTimeMs=1000.0 * rec["run_max_compute_time_s"][i],
                 )
@@ -682,7 +916,7 @@ def main():
         "2) Run-min distance (mean ± std)",
         "3) Safety violation probability using (r + r_s)",
         "4) Collision probability using (r)",
-        "5) Total cost Q+Sigma^-2 only (mean ± std)",
+        "5) Total cost Q+R only (mean ± std)",
         "6) Max compute time across runs (ms)",
         "7) Run-max compute time (mean ± std) (ms)",
     ]

@@ -129,7 +129,6 @@ def sample_candidate(rng: random.Random, mode: str):
         "dt": rng.uniform(0.015, 0.030),
         "horizon_steps": rng.choice([35, 40, 50, 60, 70]),
         "rollouts": rng.choice([512, 768, 1096, 1536, 2048]),
-        "iterations": rng.choice([1, 2, 3]),
         "lam": rng.uniform(0.4, 2.0),
         "ang_max_deg": rng.uniform(25.0, 45.0),
         "yawrate_max_deg": rng.uniform(120.0, 260.0),
@@ -176,7 +175,6 @@ def build_controller(mode: str, cfg: dict, cylinders, device: str):
         p.dt = float(cfg["dt"])
         p.horizon_steps = int(cfg["horizon_steps"])
         p.rollouts = int(cfg["rollouts"])
-        p.iterations = int(cfg["iterations"])
         p.lam = float(cfg["lam"])
         p.ang_max = math.radians(float(cfg["ang_max_deg"]))
         p.yawrate_max = math.radians(float(cfg["yawrate_max_deg"]))
@@ -199,7 +197,6 @@ def build_controller(mode: str, cfg: dict, cylinders, device: str):
         p.dt = float(cfg["dt"])
         p.horizon_steps = int(cfg["horizon_steps"])
         p.rollouts = int(cfg["rollouts"])
-        p.iterations = int(cfg["iterations"])
         p.lam = float(cfg["lam"])
         p.ang_max = math.radians(float(cfg["ang_max_deg"]))
         p.yawrate_max = math.radians(float(cfg["yawrate_max_deg"]))
@@ -223,7 +220,6 @@ def build_controller(mode: str, cfg: dict, cylinders, device: str):
         p.dt = float(cfg["dt"])
         p.horizon_steps = int(cfg["horizon_steps"])
         p.rollouts = int(cfg["rollouts"])
-        p.iterations = int(cfg["iterations"])
         p.lam = float(cfg["lam"])
         p.ang_max = math.radians(float(cfg["ang_max_deg"]))
         p.yawrate_max = math.radians(float(cfg["yawrate_max_deg"]))
@@ -241,7 +237,6 @@ def build_controller(mode: str, cfg: dict, cylinders, device: str):
         p.dt = float(cfg["dt"])
         p.horizon_steps = int(cfg["horizon_steps"])
         p.rollouts = int(cfg["rollouts"])
-        p.iterations = int(cfg["iterations"])
         p.lam = float(cfg["lam"])
         p.ang_max = math.radians(float(cfg["ang_max_deg"]))
         p.yawrate_max = math.radians(float(cfg["yawrate_max_deg"]))

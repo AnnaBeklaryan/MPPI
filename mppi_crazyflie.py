@@ -8,8 +8,8 @@ Buffered Torch-MPPI Crazyflie-like quadrotor outer-loop simulation with:
 Planner:
 - Uses MPPI from mppi_class.py (Torch)
 
-Control: u = [T, phi_cmd, theta_cmd, psi_dot_cmd]
-State:   x = [px,py,pz, vx,vy,vz, psi]
+Control: u = [roll_c, pitch_c, yaw_c, thrust]
+State:   x = [px,py,pz, vx,vy,vz, roll, pitch, yaw]
 
 This version:
 - Runs simulation and stores data in buffers
@@ -183,50 +183,47 @@ def _wrap_pi_torch(a: torch.Tensor) -> torch.Tensor:
     return (a + torch.pi) % (2.0 * torch.pi) - torch.pi
 
 
-def _z_body_world_torch(phi: torch.Tensor, theta: torch.Tensor, psi: torch.Tensor) -> torch.Tensor:
-    cphi = torch.cos(phi); sphi = torch.sin(phi)
-    cth  = torch.cos(theta); sth = torch.sin(theta)
-    cpsi = torch.cos(psi); spsi = torch.sin(psi)
-    zx = cpsi*sth*cphi + spsi*sphi
-    zy = spsi*sth*cphi - cpsi*sphi
-    zz = cth*cphi
+def _z_body_world_torch(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    croll = torch.cos(roll); sroll = torch.sin(roll)
+    cpitch = torch.cos(pitch); spitch = torch.sin(pitch)
+    cyaw = torch.cos(yaw); syaw = torch.sin(yaw)
+    zx = cyaw * spitch * croll + syaw * sroll
+    zy = syaw * spitch * croll - cyaw * sroll
+    zz = cpitch * croll
     return torch.stack([zx, zy, zz], dim=-1)
 
 
 def quad_dyn_step(X, U, dt, m, g, **_kwargs):
-    # X: (M,9) [px,py,pz,vx,vy,vz,psi,phi,theta]
+    # X: (M,9) [px,py,pz,vx,vy,vz,roll,pitch,yaw]
     p = X[:, 0:3]
     v = X[:, 3:6]
-    psi = X[:, 6]
-    phi = X[:, 7]
-    theta = X[:, 8]
+    roll = X[:, 6]
+    pitch = X[:, 7]
+    yaw = X[:, 8]
 
-    Tcmd = U[:, 0]
-    phi_cmd = U[:, 1]
-    theta_cmd = U[:, 2]
-    psidot = U[:, 3]
+    roll_c = U[:, 0]
+    pitch_c = U[:, 1]
+    yaw_c = U[:, 2]
+    thrust = U[:, 3]
 
-    tau_phi = float(_kwargs.get("tau_phi", 0.14))
-    tau_theta = float(_kwargs.get("tau_theta", 0.14))
-    ang_max = float(_kwargs.get("ang_max", math.radians(25.0)))
-    phi_rate_max = float(_kwargs.get("phi_rate_max", math.radians(250.0)))
-    theta_rate_max = float(_kwargs.get("theta_rate_max", math.radians(250.0)))
+    tau_roll = float(_kwargs.get("tau_roll", 0.14))
+    tau_pitch = float(_kwargs.get("tau_pitch", 0.14))
+    tau_yaw = float(_kwargs.get("tau_yaw", 0.14))
 
-    phi_dot = (phi_cmd - phi) / max(1e-6, tau_phi)
-    theta_dot = (theta_cmd - theta) / max(1e-6, tau_theta)
-    phi_dot = torch.clamp(phi_dot, -phi_rate_max, phi_rate_max)
-    theta_dot = torch.clamp(theta_dot, -theta_rate_max, theta_rate_max)
-    phi_next = torch.clamp(phi + float(dt) * phi_dot, -ang_max, ang_max)
-    theta_next = torch.clamp(theta + float(dt) * theta_dot, -ang_max, ang_max)
+    roll_dot = (roll_c - roll) / max(1e-6, tau_roll)
+    pitch_dot = (pitch_c - pitch) / max(1e-6, tau_pitch)
+    yaw_dot = (yaw_c - yaw) / max(1e-6, tau_yaw)
 
-    zb = _z_body_world_torch(phi, theta, psi)
+    zb = _z_body_world_torch(roll, pitch, yaw)
     gvec = torch.tensor([0.0, 0.0, float(g)], device=X.device, dtype=X.dtype)
-    a = (Tcmd[:, None] / float(m)) * zb - gvec[None, :]
+    a = (thrust[:, None] / float(m)) * zb - gvec[None, :]
 
     v_next = v + float(dt) * a
     p_next = p + float(dt) * v_next
-    psi_next = _wrap_pi_torch(psi + float(dt) * psidot)
-    return torch.cat([p_next, v_next, psi_next[:, None], phi_next[:, None], theta_next[:, None]], dim=1)
+    roll_next = roll + float(dt) * roll_dot
+    pitch_next = pitch + float(dt) * pitch_dot
+    yaw_next = yaw + float(dt) * yaw_dot
+    return torch.cat([p_next, v_next, roll_next[:, None], pitch_next[:, None], yaw_next[:, None]], dim=1)
 
 
 def running_cost_quad(
@@ -241,8 +238,8 @@ def running_cost_quad(
 ):
     ref = ref_seq[t + 1]  # (4,)
     e_pos = X[:, 0:3] - ref[None, 0:3]
-    e_psi = _wrap_pi_torch(X[:, 6] - ref[3]).unsqueeze(1)
-    e = torch.cat([e_pos, e_psi], dim=1)
+    e_yaw = _wrap_pi_torch(X[:, 8] - ref[3]).unsqueeze(1)
+    e = torch.cat([e_pos, e_yaw], dim=1)
 
     J = torch.sum((e * e) * Q[None, :], dim=1) + torch.sum((U * U) * R[None, :], dim=1)
     if (U_nom is not None) and (Rd is not None):
@@ -284,8 +281,8 @@ def running_cost_quad(
 def terminal_cost_quad(X, t_final, ref_seq, Qf, **_kwargs):
     ref = ref_seq[-1]
     e_pos = X[:, 0:3] - ref[None, 0:3]
-    e_psi = _wrap_pi_torch(X[:, 6] - ref[3]).unsqueeze(1)
-    e = torch.cat([e_pos, e_psi], dim=1)
+    e_yaw = _wrap_pi_torch(X[:, 8] - ref[3]).unsqueeze(1)
+    e = torch.cat([e_pos, e_yaw], dim=1)
     return torch.sum((e * e) * Qf[None, :], dim=1)
 
 
@@ -297,18 +294,17 @@ class MPPIParams:
     dt: float = 0.02
     horizon_steps: int = 40
     rollouts: int = 500
-    iterations: int = 2
     lam: float = 1.0
     sigma: np.ndarray | None = None
+    R_u: tuple[float, float, float, float] | None = None
     T_min: float = 0.0
     T_max: float = 0.0
     # ang_max: float = math.radians(25.0)
     ang_max: float = math.radians(40.0)
-    yawrate_max: float = math.radians(200.0)
-    tau_phi: float = 0.14
-    tau_theta: float = 0.14
-    phi_rate_max: float = math.radians(250.0)
-    theta_rate_max: float = math.radians(250.0)
+    yaw_max: float = math.radians(200.0)
+    tau_roll: float = 0.14
+    tau_pitch: float = 0.14
+    tau_yaw: float = 0.14
 
     w_cyl: float = 350.0
     cyl_safety_margin: float = 0.25
@@ -318,7 +314,7 @@ class MPPIParams:
     moving_r: float = 0.35
     moving_safety_margin: float = 0.50
     moving_alpha: float = 12.0
-    Rd_u: tuple[float, float, float, float] = (0.0, 3.0, 3.0, 0.5)
+    Rd_u: tuple[float, float, float, float] = (3.0, 3.0, 0.5, 0.0)
 
 
 class TorchMPPIQuadOuter:
@@ -334,14 +330,17 @@ class TorchMPPIQuadOuter:
             self.p.T_min = 0.0
 
         if self.p.sigma is None:
-            self.p.sigma = np.array([0.15*hover, math.radians(8.0), math.radians(8.0), math.radians(40.0)], dtype=np.float32)
+            self.p.sigma = np.array([math.radians(8.0), math.radians(8.0), math.radians(40.0), 0.15*hover], dtype=np.float32)
             
 
-        self.u_min = np.array([self.p.T_min, -self.p.ang_max, -self.p.ang_max, -self.p.yawrate_max], dtype=np.float32)
-        self.u_max = np.array([self.p.T_max,  self.p.ang_max,  self.p.ang_max,  self.p.yawrate_max], dtype=np.float32)
+        self.u_min = np.array([-self.p.ang_max, -self.p.ang_max, -self.p.yaw_max, self.p.T_min], dtype=np.float32)
+        self.u_max = np.array([self.p.ang_max, self.p.ang_max, self.p.yaw_max, self.p.T_max], dtype=np.float32)
 
         sigma_np = np.asarray(self.p.sigma, dtype=np.float32).reshape(4,)
-        self.R_np = 1.0 / np.maximum(sigma_np ** 2, 1e-12).astype(np.float32)
+        if self.p.R_u is None:
+            self.R_np = 1.0 / np.maximum(sigma_np ** 2, 1e-12).astype(np.float32)
+        else:
+            self.R_np = np.asarray(self.p.R_u, dtype=np.float32).reshape(4,)
 
         self.Rd_np = np.asarray(self.p.Rd_u, dtype=np.float32).reshape(4,)
 
@@ -375,17 +374,14 @@ class TorchMPPIQuadOuter:
             dynamics=quad_dyn_step,
             running_cost=running_cost_quad,
             terminal_cost=terminal_cost_quad,
-            I=int(self.p.iterations),
             device=self.device,
             dtype=torch.float32,
             dyn_kwargs=dict(
                 m=self.m,
                 g=self.g,
-                tau_phi=self.p.tau_phi,
-                tau_theta=self.p.tau_theta,
-                ang_max=self.p.ang_max,
-                phi_rate_max=self.p.phi_rate_max,
-                theta_rate_max=self.p.theta_rate_max,
+                tau_roll=self.p.tau_roll,
+                tau_pitch=self.p.tau_pitch,
+                tau_yaw=self.p.tau_yaw,
             ),
             cost_kwargs=dict(
                 ref_seq=None, Q=None, Qf=None, R=None, obs_seq=None,
@@ -400,7 +396,7 @@ class TorchMPPIQuadOuter:
 
         # warm-start: hover thrust
         self.mppi.U_cpu[:] = 0.0
-        self.mppi.U_cpu[:, 0] = hover
+        self.mppi.U_cpu[:, 3] = hover
         self.mppi.U = self.mppi.U_cpu
 
     def _predict_nominal_xyz(self, x0_np, U_cpu):
@@ -412,11 +408,9 @@ class TorchMPPIQuadOuter:
             u_t = torch.as_tensor(U_cpu[t].reshape(1, 4), device=self.device, dtype=torch.float32)
             x = quad_dyn_step(
                 x, u_t, self.dt, self.m, self.g,
-                tau_phi=dyn.get("tau_phi", self.p.tau_phi),
-                tau_theta=dyn.get("tau_theta", self.p.tau_theta),
-                ang_max=dyn.get("ang_max", self.p.ang_max),
-                phi_rate_max=dyn.get("phi_rate_max", self.p.phi_rate_max),
-                theta_rate_max=dyn.get("theta_rate_max", self.p.theta_rate_max),
+                tau_roll=dyn.get("tau_roll", self.p.tau_roll),
+                tau_pitch=dyn.get("tau_pitch", self.p.tau_pitch),
+                tau_yaw=dyn.get("tau_yaw", self.p.tau_yaw),
             )
             pred[t + 1] = x[0, 0:3].detach().cpu().numpy().astype(np.float32)
         return pred
@@ -503,11 +497,13 @@ def simulate(save_dir: str | None = None):
 
     # waypoints_2 = np.array([
     #     [ 2.5,  2.0, 0.0],
-    #     [ 0.0,  3.5, 2.0],
-    #     [-3.0,  1.5, 4.5],
-    #     [-2.0, -2.5, 3.0],
-    #     [ 2.0, -3.0, 1.0],
-    #     [ 3.0,  0.0, 0.5],
+    #     [-1.0, -2., 2.0],
+    #     [ -3.,  -2., 4.0],
+    #     [ -3.,  1.7, 3.5],
+    #     [ -3.,  1.7, 3.],
+    #     [ -0.2,  -1.7, 0.9],
+    #     [ 1.3,  -2.9, 0.9],
+    #     [ 3.3,  -1.6, 0.8],
     #     [ 2.5,  2.0, 0.0],
     # ], dtype=float)
 
@@ -535,26 +531,24 @@ def simulate(save_dir: str | None = None):
         for i in range(2)
     ]
     params = MPPIParams(
-        dt=0.028677838561381404,
+        dt=0.03,
         horizon_steps=35,
         rollouts=1096,
-        iterations=1,
-        lam=0.9447651256582109,
+        lam=2,
         sigma=np.array(
             [
-                0.03860791271607059,
                 math.radians(6.072834867326699),
                 math.radians(7.139534744261536),
                 math.radians(9.50181217517332),
+                0.03860791271607059,
             ],
             dtype=np.float32,
         ),
         ang_max=math.radians(28.533048677493525),
-        yawrate_max=math.radians(125.002671219858),
-        tau_phi=0.22445102088241203,
-        tau_theta=0.19182828711184713,
-        phi_rate_max=math.radians(186.91775798517736),
-        theta_rate_max=math.radians(250.74834372828798),
+        yaw_max=math.radians(125.002671219858),
+        tau_roll=0.22445102088241203,
+        tau_pitch=0.19182828711184713,
+        tau_yaw=0.22445102088241203,
         w_cyl=510.6988597095838,
         cyl_safety_margin=0.2150292356967072,
         cyl_alpha=8.72155294537059,
@@ -562,7 +556,8 @@ def simulate(save_dir: str | None = None):
         moving_r=0.3045201563139591,
         moving_safety_margin=0.4224283788684363,
         moving_alpha=15.033309531167399,
-        Rd_u=(0.9046852667672367, 2.390585391824126, 2.8043325852902052, 1.0686213306251247),
+        R_u=(2, 2, 1, 2),
+        Rd_u=(2, 2, 1, 2),
     )
 
     
@@ -590,7 +585,7 @@ def simulate(save_dir: str | None = None):
     x[7] = 0.0
     x[8] = 0.0
 
-    last_yaw_ref = float(x[6])
+    last_yaw_ref = float(x[8])
 
     def yaw_follow_from_vel(v, fallback):
         vx, vy = float(v[0]), float(v[1])
@@ -636,15 +631,15 @@ def simulate(save_dir: str | None = None):
 
         ref_seq = np.zeros((ctrl.T + 1, 4), dtype=float)
         ref_seq[0, 0:3], v0 = traj.eval(min(t, traj.total_time))
-        psi0_raw = wrap_pi(yaw_follow_from_vel(v0, last_yaw_ref))
-        ref_seq[0, 3] = last_yaw_ref + wrap_pi(psi0_raw - last_yaw_ref)
+        yaw0_raw = wrap_pi(yaw_follow_from_vel(v0, last_yaw_ref))
+        ref_seq[0, 3] = last_yaw_ref + wrap_pi(yaw0_raw - last_yaw_ref)
 
         for k in range(1, ctrl.T + 1):
             tk = min(traj.total_time, t + k * dt)
             pk, vk = traj.eval(tk)
-            psi_raw = wrap_pi(yaw_follow_from_vel(vk, ref_seq[k - 1, 3]))
+            yaw_raw = wrap_pi(yaw_follow_from_vel(vk, ref_seq[k - 1, 3]))
             prev = ref_seq[k - 1, 3]
-            ref_seq[k, 3] = prev + wrap_pi(psi_raw - prev)
+            ref_seq[k, 3] = prev + wrap_pi(yaw_raw - prev)
             ref_seq[k, 0:3] = pk
 
         last_yaw_ref = float(ref_seq[1, 3])
@@ -698,34 +693,34 @@ def simulate(save_dir: str | None = None):
         if (i % 10) == 0:
             print(f"[step {i:04d}] solve_ms={solve_ms[i]:.2f}")
 
-        Tcmd, phi_cmd, theta_cmd, yawrate = map(float, u)
-        Tcmd = clamp(Tcmd, ctrl.p.T_min, ctrl.p.T_max)
-        phi_cmd = clamp(phi_cmd, -ctrl.p.ang_max, ctrl.p.ang_max)
-        theta_cmd = clamp(theta_cmd, -ctrl.p.ang_max, ctrl.p.ang_max)
-        yawrate = clamp(yawrate, -ctrl.p.yawrate_max, ctrl.p.yawrate_max)
-        U_applied[i] = [Tcmd, phi_cmd, theta_cmd, yawrate]
+        roll_c, pitch_c, yaw_c, thrust = map(float, u)
+        roll_c = clamp(roll_c, -ctrl.p.ang_max, ctrl.p.ang_max)
+        pitch_c = clamp(pitch_c, -ctrl.p.ang_max, ctrl.p.ang_max)
+        yaw_c = clamp(yaw_c, -ctrl.p.yaw_max, ctrl.p.yaw_max)
+        thrust = clamp(thrust, ctrl.p.T_min, ctrl.p.T_max)
+        U_applied[i] = [roll_c, pitch_c, yaw_c, thrust]
 
-        phi = float(x[7])
-        theta = float(x[8])
-        cphi = math.cos(phi); sphi = math.sin(phi)
-        cth = math.cos(theta); sth = math.sin(theta)
-        cpsi = math.cos(x[6]); spsi = math.sin(x[6])
+        roll = float(x[6])
+        pitch = float(x[7])
+        yaw = float(x[8])
+        croll = math.cos(roll); sroll = math.sin(roll)
+        cpitch = math.cos(pitch); spitch = math.sin(pitch)
+        cyaw = math.cos(yaw); syaw = math.sin(yaw)
         zb = np.array([
-            cpsi*sth*cphi + spsi*sphi,
-            spsi*sth*cphi - cpsi*sphi,
-            cth*cphi,
+            cyaw * spitch * croll + syaw * sroll,
+            syaw * spitch * croll - cyaw * sroll,
+            cpitch * croll,
         ], dtype=float)
-        a = (Tcmd / ctrl.m) * zb - np.array([0.0, 0.0, ctrl.g])
-        phi_dot = (phi_cmd - phi) / max(1e-6, ctrl.p.tau_phi)
-        theta_dot = (theta_cmd - theta) / max(1e-6, ctrl.p.tau_theta)
-        phi_dot = clamp(phi_dot, -ctrl.p.phi_rate_max, ctrl.p.phi_rate_max)
-        theta_dot = clamp(theta_dot, -ctrl.p.theta_rate_max, ctrl.p.theta_rate_max)
+        a = (thrust / ctrl.m) * zb - np.array([0.0, 0.0, ctrl.g])
+        roll_dot = (roll_c - roll) / max(1e-6, ctrl.p.tau_roll)
+        pitch_dot = (pitch_c - pitch) / max(1e-6, ctrl.p.tau_pitch)
+        yaw_dot = (yaw_c - yaw) / max(1e-6, ctrl.p.tau_yaw)
 
         x[3:6] = x[3:6] + dt * a
         x[0:3] = x[0:3] + dt * x[3:6]
-        x[6] = wrap_pi(x[6] + dt * yawrate)
-        x[7] = clamp(x[7] + dt * phi_dot, -ctrl.p.ang_max, ctrl.p.ang_max)
-        x[8] = clamp(x[8] + dt * theta_dot, -ctrl.p.ang_max, ctrl.p.ang_max)
+        x[6] = x[6] + dt * roll_dot
+        x[7] = x[7] + dt * pitch_dot
+        x[8] = x[8] + dt * yaw_dot
 
         X_path[i] = x[0:3]
         X_hist[i] = x.copy()

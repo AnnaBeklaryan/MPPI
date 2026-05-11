@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""
+Create a collision-probability-vs-epsilon plot from dr_epsilon_summary.csv.
+
+Examples:
+  python3 results_dr_eps_stats/plot_dr_epsilon_summary.py
+  python3 results_dr_eps_stats/plot_dr_epsilon_summary.py \
+      --csv results_dr_eps_stats/dr_epsilon_summary.csv \
+      --out results_dr_eps_stats/dr_epsilon_collision_probability.svg
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import warnings
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+warnings.filterwarnings(
+    "ignore",
+    message="Unable to import Axes3D.*",
+    category=UserWarning,
+)
+
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FixedLocator, FormatStrFormatter, FuncFormatter, MultipleLocator
+import pandas as pd
+
+
+def parse_args() -> argparse.Namespace:
+    here = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(
+        description="Plot collision probability against epsilon from a DR-MPPI summary CSV."
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=here / "dr_epsilon_summary.csv",
+        help="Path to dr_epsilon_summary.csv",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=here / "dr_epsilon_collision_probability.svg",
+        help="Output SVG path",
+    )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default="",
+        help="Optional plot title. Leave empty to match the reference style.",
+    )
+    return parser.parse_args()
+
+
+def load_summary(csv_path: Path) -> pd.DataFrame:
+    summary_df = pd.read_csv(csv_path)
+    required_columns = {"epsilon", "collision_prob"}
+    missing_columns = required_columns - set(summary_df.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns in {csv_path}: {sorted(missing_columns)}"
+        )
+    return summary_df.sort_values("epsilon").reset_index(drop=True)
+
+
+def apply_style(ax: plt.Axes, summary_df: pd.DataFrame) -> None:
+    epsilon_values = summary_df["epsilon"].to_numpy(dtype=float)
+    max_prob = float(summary_df["collision_prob"].max())
+    max_epsilon = float(epsilon_values.max())
+    positive_eps = epsilon_values[epsilon_values > 0.0]
+    x_pad = max(0.0025, 0.02 * max_epsilon)
+
+    ax.set_xlabel("Wasserstein radius, $\\varepsilon$")
+    ax.set_ylabel("Collision probability")
+    ax.set_ylim(-0.02, max(0.9, min(1.0, max_prob + 0.1)))
+    ax.yaxis.set_major_locator(MultipleLocator(0.2))
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+
+    # Wide epsilon sweeps should use a log-like x-axis; a linear 0.2 locator
+    # would try to create millions of ticks for ranges up to 1e6.
+    if positive_eps.size >= 2 and max_epsilon / float(positive_eps.min()) >= 100.0:
+        linthresh = float(positive_eps.min())
+        ax.set_xscale("symlog", linthresh=linthresh, linscale=1.0)
+        ax.set_xlim(-0.5 * linthresh, max_epsilon * 1.1)
+        ax.xaxis.set_major_locator(FixedLocator(epsilon_values.tolist()))
+        ax.xaxis.set_major_formatter(
+            FuncFormatter(lambda value, _pos: "0" if abs(value) < 1e-15 else f"{value:g}")
+        )
+        if epsilon_values.size > 10:
+            ax.tick_params(axis="x", labelrotation=30)
+    else:
+        if max_epsilon <= 0.1:
+            x_step = 0.02
+        elif max_epsilon <= 0.5:
+            x_step = 0.05
+        elif max_epsilon <= 1.0:
+            x_step = 0.1
+        else:
+            x_step = 0.2
+
+        ax.set_xlim(-x_pad, max_epsilon + x_pad)
+        ax.xaxis.set_major_locator(MultipleLocator(x_step))
+        ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+
+    ax.grid(True, color="#b0b0b0", alpha=0.35, linewidth=1.0)
+
+
+def main() -> None:
+    args = parse_args()
+    summary_df = load_summary(args.csv)
+
+    plt.rcParams.update(
+        {
+            "font.size": 12,
+            "axes.labelsize": 14,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+        }
+    )
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    ax.plot(
+        summary_df["epsilon"].to_numpy(dtype=float),
+        summary_df["collision_prob"].to_numpy(dtype=float),
+        color="#0072B2",
+        linewidth=2.0,
+    )
+    if args.title:
+        ax.set_title(args.title)
+    apply_style(ax, summary_df)
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(args.out, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] wrote: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
