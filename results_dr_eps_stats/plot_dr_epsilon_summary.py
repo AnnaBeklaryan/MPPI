@@ -12,6 +12,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import warnings
@@ -25,7 +26,7 @@ warnings.filterwarnings(
 )
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FixedLocator, FormatStrFormatter, FuncFormatter, MultipleLocator
+from matplotlib.ticker import FormatStrFormatter, MultipleLocator
 import pandas as pd
 
 
@@ -68,44 +69,44 @@ def load_summary(csv_path: Path) -> pd.DataFrame:
 
 def apply_style(ax: plt.Axes, summary_df: pd.DataFrame) -> None:
     epsilon_values = summary_df["epsilon"].to_numpy(dtype=float)
-    max_prob = float(summary_df["collision_prob"].max())
     max_epsilon = float(epsilon_values.max())
-    positive_eps = epsilon_values[epsilon_values > 0.0]
     x_pad = max(0.0025, 0.02 * max_epsilon)
 
     ax.set_xlabel("Wasserstein radius, $\\varepsilon$")
     ax.set_ylabel("Collision probability")
-    ax.set_ylim(-0.02, max(0.9, min(1.0, max_prob + 0.1)))
+    ax.set_ylim(-0.02, 0.6)
     ax.yaxis.set_major_locator(MultipleLocator(0.2))
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
 
-    # Wide epsilon sweeps should use a log-like x-axis; a linear 0.2 locator
-    # would try to create millions of ticks for ranges up to 1e6.
-    if positive_eps.size >= 2 and max_epsilon / float(positive_eps.min()) >= 100.0:
-        linthresh = float(positive_eps.min())
-        ax.set_xscale("symlog", linthresh=linthresh, linscale=1.0)
-        ax.set_xlim(-0.5 * linthresh, max_epsilon * 1.1)
-        ax.xaxis.set_major_locator(FixedLocator(epsilon_values.tolist()))
-        ax.xaxis.set_major_formatter(
-            FuncFormatter(lambda value, _pos: "0" if abs(value) < 1e-15 else f"{value:g}")
-        )
-        if epsilon_values.size > 10:
-            ax.tick_params(axis="x", labelrotation=30)
+    # Match the reference DR plot: keep the epsilon axis linear so dense values
+    # near zero do not collapse into overlapping symlog tick labels.
+    if max_epsilon <= 0.1:
+        x_step = 0.02
+    elif max_epsilon <= 0.5:
+        x_step = 0.05
+    elif max_epsilon <= 1.0:
+        x_step = 0.1
+    elif max_epsilon <= 5.0:
+        x_step = 0.5
     else:
-        if max_epsilon <= 0.1:
-            x_step = 0.02
-        elif max_epsilon <= 0.5:
-            x_step = 0.05
-        elif max_epsilon <= 1.0:
-            x_step = 0.1
+        rough_step = max_epsilon / 5.0
+        magnitude = 10 ** math.floor(math.log10(rough_step))
+        normalized = rough_step / magnitude
+        if normalized <= 1.0:
+            step_multiplier = 1.0
+        elif normalized <= 2.0:
+            step_multiplier = 2.0
+        elif normalized <= 5.0:
+            step_multiplier = 5.0
         else:
-            x_step = 0.2
+            step_multiplier = 10.0
+        x_step = step_multiplier * magnitude
 
-        ax.set_xlim(-x_pad, max_epsilon + x_pad)
-        ax.xaxis.set_major_locator(MultipleLocator(x_step))
-        ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+    ax.set_xlim(-x_pad, max_epsilon + x_pad)
+    ax.xaxis.set_major_locator(MultipleLocator(x_step))
+    ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
 
-    ax.grid(True, color="#b0b0b0", alpha=0.35, linewidth=1.0)
+    # ax.grid(True, color="#b0b0b0", alpha=0.35, linewidth=1.0)
 
 
 def main() -> None:

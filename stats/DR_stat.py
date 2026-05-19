@@ -3,7 +3,7 @@
 Sweep DR-MPPI over Wasserstein radii (dr_eps_cvar) and plot collision probability vs epsilon.
 
 Example:
-  python3 stats/DR_stat.py --scenario 2 --runs 100 --steps 900 --use_gpu
+    python3 stats/DR_stat.py --scenario 2 --runs 70 --steps 900 --use_gpu --eps-max 0.1 --eps-step 0.001
 """
 
 from __future__ import annotations

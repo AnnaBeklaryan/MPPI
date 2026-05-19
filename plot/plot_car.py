@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import re
 from typing import Dict
 
 import matplotlib.image as mpimg
@@ -37,6 +38,9 @@ GROUND_COLOR = "#ece9e2"
 ROAD_COLOR = "#646464"
 ROUNDABOUT_ISLAND_COLOR = "#8d8d8d"
 TRANSPARENT_SPRITE = np.zeros((1, 1, 4), dtype=np.float32)
+OBSTACLE_HISTORY_STEPS = 7
+OBSTACLE_HISTORY_ALPHA_NEAR = 0.34
+OBSTACLE_HISTORY_ALPHA_FAR = 0.10
 
 
 def _hex_to_rgb01(color: str) -> np.ndarray:
@@ -54,6 +58,18 @@ def _tint_sprite(img: np.ndarray, color: str, strength: float = 0.72) -> np.ndar
     rgb = arr[..., :3]
     rgb = (1.0 - strength) * rgb + strength * (rgb * tint[None, None, :])
     arr[..., :3] = np.clip(rgb, 0.0, 1.0)
+    return arr
+
+
+def _fade_sprite(img: np.ndarray, alpha_scale: float) -> np.ndarray:
+    arr = np.asarray(img, dtype=np.float32).copy()
+    if arr.ndim != 3:
+        return arr
+    if arr.shape[2] == 3:
+        alpha = np.ones(arr.shape[:2] + (1,), dtype=arr.dtype)
+        arr = np.concatenate([arr, alpha], axis=2)
+    if arr.shape[2] == 4:
+        arr[..., 3] = np.clip(arr[..., 3] * float(alpha_scale), 0.0, 1.0)
     return arr
 
 
@@ -80,6 +96,26 @@ def _load_npz(base_dir: str, method: str) -> dict:
         raise FileNotFoundError(f"Missing saved data: {p}. Run {method}.py with --save first.")
     data = np.load(p, allow_pickle=True)
     return {k: data[k] for k in data.files}
+
+
+def _obstacle_sprite_paths(root_dir: str) -> list[str]:
+    data_dir = os.path.join(root_dir, "Data")
+    pattern = re.compile(r"^car_obs_?(\d+)\.png$")
+    indexed_paths: list[tuple[int, str]] = []
+
+    for name in os.listdir(data_dir):
+        match = pattern.match(name)
+        if match is None:
+            continue
+        indexed_paths.append((int(match.group(1)), os.path.join(data_dir, name)))
+
+    indexed_paths.sort(key=lambda item: item[0])
+    paths = [path for _, path in indexed_paths]
+    if not paths:
+        raise FileNotFoundError(
+            f"Missing obstacle sprites in {data_dir}. Expected files like car_obs1.png or car_obs_1.png."
+        )
+    return paths
 
 
 def _draw_road_markings(
@@ -128,8 +164,25 @@ def _lane_width_from_data(data: dict) -> float:
 
 def _figure_size_for_scenario(scenario: int) -> tuple[float, float]:
     if scenario in (2, 3):
-        return (12.5, 8.5)
+        return (11.0, 8.5)
     return (14.0, 5.0)
+
+
+def _apply_figure_layout(fig, scenario: int) -> None:
+    if scenario in (2, 3):
+        # The roundabout frames do not draw the side legend or a title, so use
+        # the canvas more efficiently and trim the large left/right whitespace.
+        fig.subplots_adjust(left=0.08, right=0.985, bottom=0.09, top=0.985)
+    else:
+        fig.subplots_adjust(left=0.07, right=0.985, bottom=0.10, top=0.97)
+
+
+def _fixed_axis_limits_for_scenario(
+    scenario: int,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    if scenario == 3:
+        return (0.0, 10.0), (-2.0, 5.0)
+    return None
 
 
 def _roundabout_center(
@@ -374,6 +427,71 @@ def _reference_path_xy(data: dict, scenario: int) -> np.ndarray:
     return np.zeros((0, 2), dtype=float)
 
 
+def _obstacle_history_alphas() -> np.ndarray:
+    return np.linspace(OBSTACLE_HISTORY_ALPHA_NEAR, OBSTACLE_HISTORY_ALPHA_FAR, OBSTACLE_HISTORY_STEPS, dtype=float)
+
+
+def _obstacle_history_by_id(
+    obs_xy: np.ndarray,
+    obs_phi: np.ndarray,
+    obs_ids: np.ndarray,
+    k_hist: np.ndarray,
+) -> Dict[int, dict[str, np.ndarray]]:
+    n_steps = obs_xy.shape[0]
+    max_obs = obs_xy.shape[1] if obs_xy.ndim >= 2 else 0
+    history_by_id: Dict[int, dict[str, np.ndarray]] = {}
+
+    for i in range(n_steps):
+        kk = int(k_hist[i]) if i < k_hist.shape[0] else max_obs
+        kk = max(0, min(kk, max_obs))
+        for j in range(kk):
+            oid = int(obs_ids[i, j])
+            if oid < 0 or not np.all(np.isfinite(obs_xy[i, j, :2])) or not np.isfinite(obs_phi[i, j]):
+                continue
+            if oid not in history_by_id:
+                history_by_id[oid] = {
+                    "xy": np.full((n_steps, 2), np.nan, dtype=float),
+                    "phi": np.full((n_steps,), np.nan, dtype=float),
+                }
+            history_by_id[oid]["xy"][i, :] = obs_xy[i, j, :2]
+            history_by_id[oid]["phi"][i] = float(obs_phi[i, j])
+
+    return history_by_id
+
+
+def _update_obstacle_history_icons(
+    history_imgs: Dict[int, list],
+    history_by_id: Dict[int, dict[str, np.ndarray]],
+    history_sprite_imgs: list[list[np.ndarray]],
+    id_to_sprite: Dict[int, int],
+    frame_idx: int,
+    obs_length: float,
+    obs_width: float,
+    ax,
+) -> None:
+    for oid, artists in history_imgs.items():
+        xy_hist = history_by_id[oid]["xy"]
+        phi_hist = history_by_id[oid]["phi"]
+        sprite_idx = id_to_sprite[oid]
+        for lag, artist in enumerate(artists, start=1):
+            hist_idx = frame_idx - lag
+            if hist_idx >= 0 and np.all(np.isfinite(xy_hist[hist_idx])) and np.isfinite(phi_hist[hist_idx]):
+                artist.set_data(history_sprite_imgs[sprite_idx][lag - 1])
+                artist.set_visible(True)
+                set_img_pose(
+                    artist,
+                    xy_hist[hist_idx, 0],
+                    xy_hist[hist_idx, 1],
+                    phi_hist[hist_idx],
+                    obs_length,
+                    obs_width,
+                    ax,
+                )
+            else:
+                artist.set_data(TRANSPARENT_SPRITE)
+                artist.set_visible(False)
+
+
 def _ego_obs_thresholds(data: dict) -> tuple[float, float, float]:
     ego_length = float(data["ego_length"])
     ego_width = float(data["ego_width"])
@@ -488,6 +606,7 @@ def _replay_method(
     obs_phi = np.asarray(data["obs_phi"], dtype=float)
     obs_ids = np.asarray(data["obs_ids"], dtype=int)
     k_hist = np.asarray(data["K_hist"], dtype=int)
+    obstacle_history = _obstacle_history_by_id(obs_xy, obs_phi, obs_ids, k_hist)
     xlim_hist = np.asarray(data["xlim_hist"], dtype=float)
     ylim_hist = np.asarray(data["ylim_hist"], dtype=float)
     reference_x_span, reference_y_span = reference_span
@@ -501,7 +620,7 @@ def _replay_method(
         raise FileNotFoundError(f"Missing ego sprite: {ego_img_path}")
     car_ego_img = mpimg.imread(ego_img_path)
 
-    obs_sprite_paths = [os.path.join(root_dir, "Data", f"car_obs{i}.png") for i in range(1, 15)]
+    obs_sprite_paths = _obstacle_sprite_paths(root_dir)
     obs_sprite_imgs = []
     for p in obs_sprite_paths:
         if not os.path.exists(p):
@@ -511,15 +630,19 @@ def _replay_method(
     frame_dir = _frame_run_dir(frames_root, method, scenario) if frames_root is not None else None
 
     num_sprites = len(obs_sprite_imgs)
-    id_to_sprite = {}
-    next_sprite = 0
+    id_to_sprite = {oid: idx % num_sprites for idx, oid in enumerate(sorted(obstacle_history))}
+    history_alphas = _obstacle_history_alphas()
+    history_sprite_imgs = [
+        [_fade_sprite(img, alpha) for alpha in history_alphas]
+        for img in obs_sprite_imgs
+    ]
 
     world_xmin, world_xmax = _finite_minmax(x_path[:, 0])
     world_ymin, world_ymax = _finite_minmax(x_path[:, 1])
 
     plt.ion()
     fig, ax = plt.subplots(figsize=_figure_size_for_scenario(scenario))
-    fig.subplots_adjust(right=0.80, top=0.84)
+    _apply_figure_layout(fig, scenario)
 
     ax.set_xlabel("x [scaled m]")
     ax.set_ylabel("y [scaled m]")
@@ -533,7 +656,12 @@ def _replay_method(
         world_ymin=world_ymin,
         world_ymax=world_ymax,
     )
-    if scenario == 3:
+    fixed_limits = _fixed_axis_limits_for_scenario(scenario)
+    if fixed_limits is not None:
+        (x_min, x_max), (y_min, y_max) = fixed_limits
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+    elif scenario == 3:
         x_center, y_center, x_span, y_span = _scenario_camera_view(
             data=data,
             scenario=scenario,
@@ -545,6 +673,19 @@ def _replay_method(
         )
         ax.set_xlim(x_center - 0.5 * x_span, x_center + 0.5 * x_span)
         ax.set_ylim(y_center - 0.5 * y_span, y_center + 0.5 * y_span)
+
+    obstacle_history_imgs = {}
+    for oid in sorted(obstacle_history):
+        artists = []
+        for lag in range(OBSTACLE_HISTORY_STEPS):
+            im = ax.imshow(
+                TRANSPARENT_SPRITE,
+                extent=[-0.5, 0.5, -0.5, 0.5],
+                zorder=3.1 + 0.05 * lag,
+                visible=False,
+            )
+            artists.append(im)
+        obstacle_history_imgs[oid] = artists
 
     sample_lines = []
     for _ in range(n_show):
@@ -580,15 +721,15 @@ def _replay_method(
     legend_labels = ["Ego path", "MPPI prediction"]
     legend_handles += extra_handles
     legend_labels += extra_labels
-    ax.legend(
-        legend_handles,
-        legend_labels,
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        borderaxespad=0.0,
-        frameon=True,
-        handlelength=2.6,
-    )
+    # ax.legend(
+    #     legend_handles,
+    #     legend_labels,
+    #     loc="center left",
+    #     bbox_to_anchor=(1.02, 0.5),
+    #     borderaxespad=0.0,
+    #     frameon=True,
+    #     handlelength=2.6,
+    # )
 
     for i in range(n_steps):
         path_line.set_data(x_path[: i + 2, 0], x_path[: i + 2, 1])
@@ -606,15 +747,21 @@ def _replay_method(
                 sample_lines[j].set_data([], [])
 
         set_img_pose(ego_img_artist, x_hist[i, 0], x_hist[i, 1], x_hist[i, 2], ego_length, ego_width, ax)
+        _update_obstacle_history_icons(
+            obstacle_history_imgs,
+            obstacle_history,
+            history_sprite_imgs,
+            id_to_sprite,
+            i,
+            obs_length,
+            obs_width,
+            ax,
+        )
 
         kk = int(k_hist[i])
         for j in range(max_obs_draw):
             if j < kk and np.all(np.isfinite(obs_xy[i, j])) and np.isfinite(obs_phi[i, j]):
                 oid = int(obs_ids[i, j])
-                if oid not in id_to_sprite:
-                    id_to_sprite[oid] = next_sprite
-                    next_sprite = (next_sprite + 1) % num_sprites
-
                 sprite_idx = id_to_sprite[oid]
                 obs_imgs[j].set_data(obs_sprite_imgs[sprite_idx])
                 obs_imgs[j].set_visible(True)
@@ -714,6 +861,7 @@ def _replay_compare(
     obs_phi = np.asarray(base_data["obs_phi"], dtype=float)[:n_steps]
     obs_ids = np.asarray(base_data["obs_ids"], dtype=int)[:n_steps]
     k_hist = np.asarray(base_data["K_hist"], dtype=int)[:n_steps]
+    obstacle_history = _obstacle_history_by_id(obs_xy, obs_phi, obs_ids, k_hist)
     max_obs_draw = obs_xy.shape[1]
     collision_hists = {
         method: _infer_collision_hist(all_data[method], obs_xy, k_hist, n_steps)
@@ -727,7 +875,7 @@ def _replay_compare(
     obs_length = float(base_data["obs_length"])
     obs_width = float(base_data["obs_width"])
 
-    obs_sprite_paths = [os.path.join(root_dir, "Data", f"car_obs{i}.png") for i in range(1, 15)]
+    obs_sprite_paths = _obstacle_sprite_paths(root_dir)
     obs_sprite_imgs = []
     for p in obs_sprite_paths:
         if not os.path.exists(p):
@@ -737,8 +885,12 @@ def _replay_compare(
     frame_dir = _frame_run_dir(frames_root, "compare", scenario) if frames_root is not None else None
 
     num_sprites = len(obs_sprite_imgs)
-    id_to_sprite = {}
-    next_sprite = 0
+    id_to_sprite = {oid: idx % num_sprites for idx, oid in enumerate(sorted(obstacle_history))}
+    history_alphas = _obstacle_history_alphas()
+    history_sprite_imgs = [
+        [_fade_sprite(img, alpha) for alpha in history_alphas]
+        for img in obs_sprite_imgs
+    ]
 
     world_xmin = min(_finite_minmax(x_paths[method][:max_path_len, 0])[0] for method in METHOD_ORDER)
     world_xmax = max(_finite_minmax(x_paths[method][:max_path_len, 0])[1] for method in METHOD_ORDER)
@@ -747,7 +899,7 @@ def _replay_compare(
 
     plt.ion()
     fig, ax = plt.subplots(figsize=_figure_size_for_scenario(scenario))
-    fig.subplots_adjust(right=0.80, top=0.84)
+    _apply_figure_layout(fig, scenario)
 
     ax.set_xlabel("x [scaled m]")
     ax.set_ylabel("y [scaled m]")
@@ -761,7 +913,12 @@ def _replay_compare(
         world_ymin=world_ymin,
         world_ymax=world_ymax,
     )
-    if scenario == 3:
+    fixed_limits = _fixed_axis_limits_for_scenario(scenario)
+    if fixed_limits is not None:
+        (x_min, x_max), (y_min, y_max) = fixed_limits
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+    elif scenario == 3:
         x_center, y_center, x_span, y_span = _scenario_camera_view(
             data=base_data,
             scenario=scenario,
@@ -773,6 +930,19 @@ def _replay_compare(
         )
         ax.set_xlim(x_center - 0.5 * x_span, x_center + 0.5 * x_span)
         ax.set_ylim(y_center - 0.5 * y_span, y_center + 0.5 * y_span)
+
+    obstacle_history_imgs = {}
+    for oid in sorted(obstacle_history):
+        artists = []
+        for lag in range(OBSTACLE_HISTORY_STEPS):
+            im = ax.imshow(
+                TRANSPARENT_SPRITE,
+                extent=[-0.5, 0.5, -0.5, 0.5],
+                zorder=3.1 + 0.05 * lag,
+                visible=False,
+            )
+            artists.append(im)
+        obstacle_history_imgs[oid] = artists
 
     # Reference / waypoint plotting intentionally disabled.
 
@@ -820,15 +990,15 @@ def _replay_compare(
     compare_legend_handles += extra_handles
     compare_legend_labels += extra_labels
 
-    ax.legend(
-        compare_legend_handles,
-        compare_legend_labels,
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        borderaxespad=0.0,
-        frameon=True,
-        handlelength=2.6,
-    )
+    # ax.legend(
+    #     compare_legend_handles,
+    #     compare_legend_labels,
+    #     loc="center left",
+    #     bbox_to_anchor=(1.02, 0.5),
+    #     borderaxespad=0.0,
+    #     frameon=True,
+    #     handlelength=2.6,
+    # )
 
     for i in range(n_steps):
         for method in METHOD_ORDER:
@@ -842,14 +1012,21 @@ def _replay_compare(
                 ego_markers[method].set_markeredgecolor("white")
                 ego_markers[method].set_markeredgewidth(1.0)
 
+        _update_obstacle_history_icons(
+            obstacle_history_imgs,
+            obstacle_history,
+            history_sprite_imgs,
+            id_to_sprite,
+            i,
+            obs_length,
+            obs_width,
+            ax,
+        )
+
         kk = int(k_hist[i])
         for j in range(max_obs_draw):
             if j < kk and np.all(np.isfinite(obs_xy[i, j])) and np.isfinite(obs_phi[i, j]):
                 oid = int(obs_ids[i, j])
-                if oid not in id_to_sprite:
-                    id_to_sprite[oid] = next_sprite
-                    next_sprite = (next_sprite + 1) % num_sprites
-
                 sprite_idx = id_to_sprite[oid]
                 obs_imgs[j].set_data(obs_sprite_imgs[sprite_idx])
                 obs_imgs[j].set_visible(True)
