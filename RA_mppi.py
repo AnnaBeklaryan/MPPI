@@ -581,8 +581,8 @@ if __name__ == "__main__":
         x_mppi = ref_path_xypsi[0].astype(np.float32)
 
     # Geometry
-    ego_length = 4.5 * pos_scale
-    ego_width = 1.8 * pos_scale
+    ego_length = 8. * pos_scale
+    ego_width = 3. * pos_scale
     obs_length = ego_length
     obs_width = ego_width
 
@@ -594,8 +594,8 @@ if __name__ == "__main__":
     N_SHOW = int(min(max(1, N_SHOW), M))
     max_obs_draw = 20
 
-    x_ahead = 18.0
-    x_behind = 4.0
+    x_ahead = 1.0
+    x_behind = 1.0
     y_halfspan = 2.8
 
     save_dir = os.path.join(base_dir, "plot")

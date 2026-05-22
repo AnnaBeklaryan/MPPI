@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FormatStrFormatter, MultipleLocator
+from matplotlib.ticker import FormatStrFormatter, LogLocator, MultipleLocator
 import numpy as np
 import pandas as pd
 import torch
@@ -22,6 +22,7 @@ import benchmark_mppi_stats as bench
 
 
 DEFAULT_EPSILONS = np.arange(0.0, 0.1001, 0.005, dtype=np.float64)
+DEFAULT_PLOT_XMAX = 0.05
 
 
 def parse_args() -> argparse.Namespace:
@@ -391,10 +392,21 @@ def log_controller_device_status(ctrl, requested_gpu: bool) -> None:
         )
 
 
-def save_collision_plot(summary_df: pd.DataFrame, outdir: Path, scenario: int, save_pdf: bool) -> None:
+def _apply_collision_y_style(ax: plt.Axes) -> None:
+    ax.set_xlabel("Wasserstein radius, $\\varepsilon$")
+    ax.set_ylabel("Collision probability")
+    ax.set_ylim(-0.02, 1.02)
+    ax.yaxis.set_major_locator(MultipleLocator(0.2))
+    ax.yaxis.set_minor_locator(MultipleLocator(0.1))
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+    ax.grid(True, which="major", alpha=0.35, linewidth=0.9)
+    ax.grid(True, which="minor", alpha=0.25, linewidth=0.6)
+
+
+def save_collision_plot(summary_df: pd.DataFrame, outdir: Path, scenario: int, save_pdf: bool) -> list[Path]:
     epsilon_values = summary_df["epsilon"].to_numpy(dtype=float)
-    max_epsilon = float(np.max(epsilon_values)) if len(epsilon_values) > 0 else 0.0
-    x_pad = max(0.0025, 0.02 * max_epsilon)
+    x_max = DEFAULT_PLOT_XMAX
+    saved_paths: list[Path] = []
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
     ax.plot(
@@ -404,23 +416,56 @@ def save_collision_plot(summary_df: pd.DataFrame, outdir: Path, scenario: int, s
         color="#0072B2",
         label="Collision probability",
     )
-    ax.set_xlabel("Wasserstein radius, $\\varepsilon$")
-    ax.set_ylabel("Collision probability")
-    ax.set_xlim(-x_pad, max_epsilon + x_pad)
-    ax.set_ylim(-0.02, 1.02)
-    ax.xaxis.set_major_locator(MultipleLocator(0.02))
+    _apply_collision_y_style(ax)
+    ax.set_xlim(0.0, x_max)
+    ax.xaxis.set_major_locator(MultipleLocator(0.01))
+    ax.xaxis.set_minor_locator(MultipleLocator(0.005))
     ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
-    ax.yaxis.set_major_locator(MultipleLocator(0.2))
-    ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
     ax.set_title(f"DR-MPPI Collision Probability vs. Wasserstein Radius | Scenario {scenario}")
-    ax.grid(True, alpha=0.3)
     ax.legend()
     png_path = outdir / "dr_epsilon_collision_probability.png"
     plt.savefig(png_path, dpi=300, bbox_inches="tight")
+    saved_paths.append(png_path)
     if save_pdf:
         pdf_path = outdir / "dr_epsilon_collision_probability.pdf"
         plt.savefig(pdf_path, bbox_inches="tight")
+        saved_paths.append(pdf_path)
     plt.close(fig)
+
+    positive_mask = np.isfinite(epsilon_values) & (epsilon_values > 0.0) & (epsilon_values <= x_max)
+    if not np.any(positive_mask):
+        print(
+            f"[WARN] skipped log-x collision plot: no positive epsilon values within x <= {x_max:.3f}.",
+            flush=True,
+        )
+        return saved_paths
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    ax.plot(
+        epsilon_values[positive_mask],
+        summary_df.loc[positive_mask, "collision_prob"].to_numpy(dtype=float),
+        linewidth=2.0,
+        color="#0072B2",
+        label="Collision probability",
+    )
+    _apply_collision_y_style(ax)
+    ax.set_xscale("log")
+    ax.set_xlim(
+        float(np.min(epsilon_values[positive_mask])),
+        float(np.max(epsilon_values[positive_mask])),
+    )
+    ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1))
+    ax.set_title(f"DR-MPPI Collision Probability vs. Wasserstein Radius (log x-axis) | Scenario {scenario}")
+    ax.legend()
+    png_path = outdir / "dr_epsilon_collision_probability_logx.png"
+    plt.savefig(png_path, dpi=300, bbox_inches="tight")
+    saved_paths.append(png_path)
+    if save_pdf:
+        pdf_path = outdir / "dr_epsilon_collision_probability_logx.pdf"
+        plt.savefig(pdf_path, bbox_inches="tight")
+        saved_paths.append(pdf_path)
+    plt.close(fig)
+    return saved_paths
 
 
 def main() -> None:
@@ -540,13 +585,17 @@ def main() -> None:
     run_df.to_csv(run_csv, index=False)
     summary_df.to_csv(summary_csv, index=False)
 
-    save_collision_plot(summary_df=summary_df, outdir=outdir, scenario=int(args.scenario), save_pdf=bool(args.pdf))
+    saved_plot_paths = save_collision_plot(
+        summary_df=summary_df,
+        outdir=outdir,
+        scenario=int(args.scenario),
+        save_pdf=bool(args.pdf),
+    )
 
     print(f"[OK] wrote: {run_csv}", flush=True)
     print(f"[OK] wrote: {summary_csv}", flush=True)
-    print(f"[OK] wrote: {outdir / 'dr_epsilon_collision_probability.png'}", flush=True)
-    if args.pdf:
-        print(f"[OK] wrote: {outdir / 'dr_epsilon_collision_probability.pdf'}", flush=True)
+    for path in saved_plot_paths:
+        print(f"[OK] wrote: {path}", flush=True)
 
 
 if __name__ == "__main__":

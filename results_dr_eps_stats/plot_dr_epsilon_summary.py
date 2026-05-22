@@ -12,7 +12,6 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import math
 import os
 from pathlib import Path
 import warnings
@@ -26,8 +25,12 @@ warnings.filterwarnings(
 )
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FormatStrFormatter, MultipleLocator
+from matplotlib.ticker import FormatStrFormatter, LogLocator, MultipleLocator
+import numpy as np
 import pandas as pd
+
+
+DEFAULT_X_MAX = 0.05
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,13 +48,25 @@ def parse_args() -> argparse.Namespace:
         "--out",
         type=Path,
         default=here / "dr_epsilon_collision_probability.svg",
-        help="Output SVG path",
+        help="Output plot path for the linear-x plot.",
+    )
+    parser.add_argument(
+        "--log-out",
+        type=Path,
+        default=None,
+        help="Optional output path for the log-x plot. Defaults to '<out stem>_logx<suffix>'.",
     )
     parser.add_argument(
         "--title",
         type=str,
         default="",
         help="Optional plot title. Leave empty to match the reference style.",
+    )
+    parser.add_argument(
+        "--x-max",
+        type=float,
+        default=DEFAULT_X_MAX,
+        help="Upper x-axis limit for the exported plots.",
     )
     return parser.parse_args()
 
@@ -67,46 +82,53 @@ def load_summary(csv_path: Path) -> pd.DataFrame:
     return summary_df.sort_values("epsilon").reset_index(drop=True)
 
 
-def apply_style(ax: plt.Axes, summary_df: pd.DataFrame) -> None:
-    epsilon_values = summary_df["epsilon"].to_numpy(dtype=float)
-    max_epsilon = float(epsilon_values.max())
-    x_pad = max(0.0025, 0.02 * max_epsilon)
-
+def _apply_common_style(ax: plt.Axes) -> None:
     ax.set_xlabel("Wasserstein radius, $\\varepsilon$")
     ax.set_ylabel("Collision probability")
     ax.set_ylim(-0.02, 0.6)
     ax.yaxis.set_major_locator(MultipleLocator(0.2))
+    ax.yaxis.set_minor_locator(MultipleLocator(0.1))
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+    ax.grid(True, which="major", color="#b0b0b0", alpha=0.35, linewidth=0.9)
+    ax.grid(True, which="minor", color="#b0b0b0", alpha=0.35, linewidth=0.9)
 
-    # Match the reference DR plot: keep the epsilon axis linear so dense values
-    # near zero do not collapse into overlapping symlog tick labels.
-    if max_epsilon <= 0.1:
-        x_step = 0.02
-    elif max_epsilon <= 0.5:
-        x_step = 0.05
-    elif max_epsilon <= 1.0:
-        x_step = 0.1
-    elif max_epsilon <= 5.0:
-        x_step = 0.5
-    else:
-        rough_step = max_epsilon / 5.0
-        magnitude = 10 ** math.floor(math.log10(rough_step))
-        normalized = rough_step / magnitude
-        if normalized <= 1.0:
-            step_multiplier = 1.0
-        elif normalized <= 2.0:
-            step_multiplier = 2.0
-        elif normalized <= 5.0:
-            step_multiplier = 5.0
-        else:
-            step_multiplier = 10.0
-        x_step = step_multiplier * magnitude
 
-    ax.set_xlim(-x_pad, max_epsilon + x_pad)
+def _linear_x_step(x_max: float) -> float:
+    if x_max <= 0.05:
+        return 0.01
+    if x_max <= 0.1:
+        return 0.02
+    if x_max <= 0.5:
+        return 0.05
+    return 0.1
+
+
+def apply_linear_style(ax: plt.Axes, x_max: float) -> None:
+    _apply_common_style(ax)
+    x_step = _linear_x_step(x_max)
+    ax.set_xlim(0.0, x_max)
     ax.xaxis.set_major_locator(MultipleLocator(x_step))
+    ax.xaxis.set_minor_locator(MultipleLocator(x_step / 2.0))
     ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
 
-    # ax.grid(True, color="#b0b0b0", alpha=0.35, linewidth=1.0)
+
+def positive_log_subset(summary_df: pd.DataFrame, x_max: float) -> pd.DataFrame:
+    eps = summary_df["epsilon"].to_numpy(dtype=float)
+    mask = np.isfinite(eps) & (eps > 0.0) & (eps <= x_max)
+    return summary_df.loc[mask].copy()
+
+
+def apply_log_style(ax: plt.Axes, summary_df: pd.DataFrame) -> None:
+    _apply_common_style(ax)
+    eps = summary_df["epsilon"].to_numpy(dtype=float)
+    ax.set_xscale("log")
+    ax.set_xlim(float(np.min(eps)), float(np.max(eps)))
+    ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1))
+
+
+def save_figure(fig: plt.Figure, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight")
 
 
 def main() -> None:
@@ -131,12 +153,38 @@ def main() -> None:
     )
     if args.title:
         ax.set_title(args.title)
-    apply_style(ax, summary_df)
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(args.out, format="svg", bbox_inches="tight")
+    apply_linear_style(ax, float(args.x_max))
+    save_figure(fig, args.out)
     plt.close(fig)
     print(f"[OK] wrote: {args.out}")
+
+    log_out = args.log_out
+    if log_out is None:
+        log_out = args.out.with_name(f"{args.out.stem}_logx{args.out.suffix}")
+
+    log_df = positive_log_subset(summary_df, float(args.x_max))
+    if log_df.empty:
+        print(
+            "[WARN] skipped log-x plot: there are no positive epsilon values "
+            f"within x <= {float(args.x_max):.3f}."
+        )
+        return
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    ax.plot(
+        log_df["epsilon"].to_numpy(dtype=float),
+        log_df["collision_prob"].to_numpy(dtype=float),
+        color="#0072B2",
+        linewidth=2.0,
+    )
+    if args.title:
+        ax.set_title(args.title)
+    apply_log_style(ax, log_df)
+    save_figure(fig, log_out)
+    plt.close(fig)
+    print(f"[OK] wrote: {log_out}")
+    if np.any(summary_df["epsilon"].to_numpy(dtype=float) <= 0.0):
+        print("[note] omitted epsilon=0.0 from the log-x plot because logarithmic axes cannot display zero.")
 
 
 if __name__ == "__main__":

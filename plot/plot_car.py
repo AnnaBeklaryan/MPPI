@@ -41,6 +41,8 @@ TRANSPARENT_SPRITE = np.zeros((1, 1, 4), dtype=np.float32)
 OBSTACLE_HISTORY_STEPS = 7
 OBSTACLE_HISTORY_ALPHA_NEAR = 0.34
 OBSTACLE_HISTORY_ALPHA_FAR = 0.10
+EGO_RADIUS_COLOR = "#73f0ff"
+OBS_RADIUS_COLOR = "#ffb15a"
 
 
 def _hex_to_rgb01(color: str) -> np.ndarray:
@@ -74,11 +76,33 @@ def _fade_sprite(img: np.ndarray, alpha_scale: float) -> np.ndarray:
 
 
 def set_img_pose(img_artist, x, y, phi, length_along_heading, width_lateral, ax):
-    L = float(length_along_heading) * 2.0
-    W = float(width_lateral) * 2.0
+    L = float(length_along_heading)
+    W = float(width_lateral)
     img_artist.set_extent([-L / 2.0, L / 2.0, -W / 2.0, W / 2.0])
     tr = Affine2D().rotate(phi).translate(x, y) + ax.transData
     img_artist.set_transform(tr)
+
+
+def _add_radius_circle(ax, radius: float, color: str, zorder: float, *, alpha: float = 0.72) -> Circle:
+    circle = Circle(
+        (0.0, 0.0),
+        float(radius),
+        fill=False,
+        edgecolor=color,
+        linewidth=1.35,
+        linestyle=(0, (4, 2)),
+        alpha=alpha,
+        visible=False,
+        zorder=zorder,
+    )
+    ax.add_patch(circle)
+    return circle
+
+
+def _set_radius_circle(circle: Circle, x: float, y: float, radius: float, visible: bool) -> None:
+    circle.center = (float(x), float(y))
+    circle.radius = float(radius)
+    circle.set_visible(bool(visible))
 
 
 def _set_obstacle_label(label_artist, x: float, y: float, oid: int, obs_length: float, obs_width: float) -> None:
@@ -570,6 +594,7 @@ def _replay_method(
     ego_width = float(data["ego_width"])
     obs_length = float(data["obs_length"])
     obs_width = float(data["obs_width"])
+    ego_radius, obs_radius, _collision_threshold = _ego_obs_thresholds(data)
 
     sim_time = np.asarray(data["sim_time"], dtype=float)
     solve_ms = np.asarray(data["solve_ms"], dtype=float)
@@ -697,12 +722,15 @@ def _replay_method(
     # Reference / waypoint plotting intentionally disabled.
 
     ego_img_artist = ax.imshow(car_ego_img, extent=[-0.5, 0.5, -0.5, 0.5], zorder=6)
+    ego_radius_circle = _add_radius_circle(ax, ego_radius, EGO_RADIUS_COLOR, zorder=5.6)
 
     obs_imgs = []
+    obs_radius_circles = []
     obs_labels = []
     for _ in range(max_obs_draw):
         im = ax.imshow(TRANSPARENT_SPRITE, extent=[-0.5, 0.5, -0.5, 0.5], zorder=4, visible=False)
         obs_imgs.append(im)
+        obs_radius_circles.append(_add_radius_circle(ax, obs_radius, OBS_RADIUS_COLOR, zorder=4.8, alpha=0.64))
         txt = ax.text(
             0.0,
             0.0,
@@ -747,6 +775,7 @@ def _replay_method(
                 sample_lines[j].set_data([], [])
 
         set_img_pose(ego_img_artist, x_hist[i, 0], x_hist[i, 1], x_hist[i, 2], ego_length, ego_width, ax)
+        _set_radius_circle(ego_radius_circle, x_hist[i, 0], x_hist[i, 1], ego_radius, True)
         _update_obstacle_history_icons(
             obstacle_history_imgs,
             obstacle_history,
@@ -774,10 +803,12 @@ def _replay_method(
                     obs_width,
                     ax,
                 )
-                # _set_obstacle_label(obs_labels[j], obs_xy[i, j, 0], obs_xy[i, j, 1], oid, obs_length, obs_width)
+                _set_radius_circle(obs_radius_circles[j], obs_xy[i, j, 0], obs_xy[i, j, 1], obs_radius, True)
+                _set_obstacle_label(obs_labels[j], obs_xy[i, j, 0], obs_xy[i, j, 1], oid, obs_length, obs_width)
             else:
                 obs_imgs[j].set_data(TRANSPARENT_SPRITE)
                 obs_imgs[j].set_visible(False)
+                obs_radius_circles[j].set_visible(False)
                 obs_labels[j].set_visible(False)
 
         if scenario != 3 and np.all(np.isfinite(xlim_hist[i])) and np.all(np.isfinite(ylim_hist[i])):
@@ -872,8 +903,13 @@ def _replay_compare(
         for method in METHOD_ORDER
     }
 
+    ego_radii = {
+        method: _ego_obs_thresholds(all_data[method])[0]
+        for method in METHOD_ORDER
+    }
     obs_length = float(base_data["obs_length"])
     obs_width = float(base_data["obs_width"])
+    _ego_radius_base, obs_radius, _collision_threshold = _ego_obs_thresholds(base_data)
 
     obs_sprite_paths = _obstacle_sprite_paths(root_dir)
     obs_sprite_imgs = []
@@ -948,6 +984,7 @@ def _replay_compare(
 
     path_lines = {}
     ego_markers = {}
+    ego_radius_circles = {}
     for method in METHOD_ORDER:
         color = METHOD_COLORS[method]
         label = METHOD_LABELS[method]
@@ -965,12 +1002,15 @@ def _replay_compare(
         )
         path_lines[method] = line
         ego_markers[method] = marker
+        ego_radius_circles[method] = _add_radius_circle(ax, ego_radii[method], color, zorder=5.4 + 0.1 * METHOD_ORDER.index(method), alpha=0.42)
 
     obs_imgs = []
+    obs_radius_circles = []
     obs_labels = []
     for _ in range(max_obs_draw):
         im = ax.imshow(TRANSPARENT_SPRITE, extent=[-0.5, 0.5, -0.5, 0.5], zorder=4, visible=False)
         obs_imgs.append(im)
+        obs_radius_circles.append(_add_radius_circle(ax, obs_radius, OBS_RADIUS_COLOR, zorder=4.8, alpha=0.56))
         txt = ax.text(
             0.0,
             0.0,
@@ -1011,6 +1051,13 @@ def _replay_compare(
             else:
                 ego_markers[method].set_markeredgecolor("white")
                 ego_markers[method].set_markeredgewidth(1.0)
+            _set_radius_circle(
+                ego_radius_circles[method],
+                x_hists[method][i, 0],
+                x_hists[method][i, 1],
+                ego_radii[method],
+                True,
+            )
 
         _update_obstacle_history_icons(
             obstacle_history_imgs,
@@ -1039,10 +1086,12 @@ def _replay_compare(
                     obs_width,
                     ax,
                 )
+                _set_radius_circle(obs_radius_circles[j], obs_xy[i, j, 0], obs_xy[i, j, 1], obs_radius, True)
                 # _set_obstacle_label(obs_labels[j], obs_xy[i, j, 0], obs_xy[i, j, 1], oid, obs_length, obs_width)
             else:
                 obs_imgs[j].set_data(TRANSPARENT_SPRITE)
                 obs_imgs[j].set_visible(False)
+                obs_radius_circles[j].set_visible(False)
                 obs_labels[j].set_visible(False)
 
         x_lows = []
