@@ -12,6 +12,9 @@ This version:
 
 Control: u = [roll_c, pitch_c, yaw_c, thrust]
 State:   x = [px,py,pz, vx,vy,vz, roll, pitch, yaw]
+
+python3 RA_mppi_crazyflie.py  --obs-update-steps 15 --steps 400 --save
+
 """
 
 from __future__ import annotations
@@ -320,7 +323,7 @@ def terminal_cost_ra(
 class Params:
     dt: float = 0.02
     horizon_steps: int = 60
-    rollouts: int = 2048
+    rollouts: int = 1200
     lam: float = 1.0
 
     # bounds
@@ -343,11 +346,11 @@ class Params:
 
     drone_radius: float = 0.25
 
-    # RA CVaR settings (XY only, because RA_MPPI is 2D obstacles)
+    # RA CVaR settings (XYZ, matching DR_mppi_crazyflie.py)
     cvar_alpha: float = 0.9
     cvar_N: int = 64
-    obs_pos_sigma_xy: tuple[float, float] = (0.25, 0.25)
-    obs_noise_mode: str = "static"
+    obs_pos_sigma_xyz: tuple[float, float, float] = (0.25, 0.25, 0.25)
+    noise_mode: str = "static"
     risk_cost_A: float = 0.0
     risk_cost_Cu: float = 0.0
 
@@ -452,8 +455,8 @@ class TorchRAQuad:
             ),
             cvar_alpha=float(self.p.cvar_alpha),
             cvar_N=int(self.p.cvar_N),
-            obs_pos_sigma=np.array(self.p.obs_pos_sigma_xy, dtype=np.float32),
-            obs_noise_mode=str(self.p.obs_noise_mode),
+            obs_pos_sigma=np.asarray(self.p.obs_pos_sigma_xyz, dtype=np.float32),
+            obs_noise_mode=str(self.p.noise_mode),
             risk_cost_A=float(self.p.risk_cost_A),
             risk_cost_Cu=float(self.p.risk_cost_Cu),
             verbose=False,
@@ -499,20 +502,20 @@ class TorchRAQuad:
         if obs_seq_np is not None:
             obs_seq_t = torch.as_tensor(obs_seq_np, device=self.device, dtype=torch.float32)
             if obs_seq_t.ndim == 2:
-                O_mean_xy = obs_seq_t[1:self.T+1, 0:2].unsqueeze(1)  # (T,1,2)
+                O_mean = obs_seq_t[1:self.T+1, 0:3].unsqueeze(1)  # (T,1,3)
                 K = 1
             elif obs_seq_t.ndim == 3:
-                O_mean_xy = obs_seq_t[1:self.T+1, :, 0:2]  # (T,K,2)
+                O_mean = obs_seq_t[1:self.T+1, :, 0:3]  # (T,K,3)
                 K = int(obs_seq_t.shape[1])
             else:
                 raise ValueError(f"obs_seq_np must be (T+1,3) or (T+1,K,3), got shape={tuple(obs_seq_t.shape)}")
 
-            # effective collision radius in XY (sphere approximation)
+            # effective collision radius in XYZ (sphere approximation)
             R_eff = float(self.p.moving_r + self.p.drone_radius + self.p.moving_margin)
             radii = torch.full((K,), R_eff, device=self.device, dtype=torch.float32)
         else:
             obs_seq_t = None
-            O_mean_xy = None
+            O_mean = None
             radii = None
 
         ck = self.mppi.cost_kwargs
@@ -521,7 +524,7 @@ class TorchRAQuad:
         ck["Qf"] = Qf_t
         ck["R"] = R_t
         ck["obs_seq"] = obs_seq_t
-        ck["O_mean"] = O_mean_xy
+        ck["O_mean"] = O_mean
         ck["radii"] = radii
         ck["U_nom"] = torch.as_tensor(self.mppi.U_cpu, device=self.device, dtype=torch.float32)
         ck["Rd"] = torch.as_tensor(self.Rd_np, device=self.device, dtype=torch.float32)
@@ -630,7 +633,7 @@ def simulate(
     p = Params(
         dt=0.03,
         horizon_steps=35,
-        rollouts=2000,
+        rollouts=1200,
         lam=2,
         ang_max=math.radians(28.533048677493525),
         yaw_max=math.radians(125.002671219858),
@@ -647,8 +650,8 @@ def simulate(
         drone_radius=0.4,
         cvar_alpha=0.95,
         cvar_N=30,
-        obs_pos_sigma_xy=(0.1, 0.1),
-        obs_noise_mode="per_step",
+        obs_pos_sigma_xyz=(0.1, 0.1, 0.1),
+        noise_mode="per_step",
         risk_cost_A=10.0,
         risk_cost_Cu=0.0,
         R_u=(1, 1, 1, 1),

@@ -12,7 +12,8 @@ This version:
 - Runs full simulation and stores state/obstacle/solve-time buffers
 - Saves buffers to .npz for offline plotting/replay
 
-    python3 DR_mppi_crazyflie.py  --obs-update-steps 20 --save
+    python3 DR_mppi_crazyflie.py  --obs-update-steps 15 --steps 400 --save
+
 
 """
 

@@ -15,6 +15,9 @@ This version:
 - Runs simulation and stores data in buffers
 - Saves buffers to .npz for offline plotting/replay
 - Prints solve time during simulation
+
+python3 mppi_crazyflie.py  --obs-update-steps 15 --steps 400 --save
+
 """
 
 from __future__ import annotations
@@ -551,7 +554,7 @@ def simulate(
     params = MPPIParams(
         dt=0.03,
         horizon_steps=35,
-        rollouts=5000,
+        rollouts=1200,
         lam=2,
         sigma=np.array(
             [

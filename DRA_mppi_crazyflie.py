@@ -305,7 +305,7 @@ def terminal_cost_quad(X: torch.Tensor, t_final: int, ref_seq: torch.Tensor, Qf:
 class DRAParams:
     dt: float = 0.02
     horizon_steps: int = 60
-    rollouts: int = 1096
+    rollouts: int = 1200
     lam: float = 1.0
 
     # bounds
@@ -591,7 +591,7 @@ def simulate(
     params = DRAParams(
         dt=0.03,
         horizon_steps=35,
-        rollouts=5000,
+        rollouts=1200,
         lam=2,
 
         ang_max=math.radians(28.533048677493525),
