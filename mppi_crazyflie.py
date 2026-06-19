@@ -186,6 +186,9 @@ def _wrap_pi_torch(a: torch.Tensor) -> torch.Tensor:
     return (a + torch.pi) % (2.0 * torch.pi) - torch.pi
 
 
+STATIC_BUILDING_RADIUS_SCALE = math.sqrt(2.0)
+
+
 def _z_body_world_torch(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
     croll = torch.cos(roll); sroll = torch.sin(roll)
     cpitch = torch.cos(pitch); spitch = torch.sin(pitch)
@@ -255,7 +258,11 @@ def running_cost_quad(
         dy = py - cyl_cy[None, :]
         d_xy = torch.sqrt(dx * dx + dy * dy)
         signed = d_xy - (cyl_r[None, :] + float(cyl_safety_margin) + float(drone_radius))
-        inside_z = (pz >= cyl_zmin[None, :]) & (pz <= cyl_zmax[None, :])
+        z_gate_margin = float(cyl_safety_margin) + float(drone_radius)
+        inside_z = (
+            (pz >= (cyl_zmin[None, :] - z_gate_margin))
+            & (pz <= (cyl_zmax[None, :] + z_gate_margin))
+        )
         pen = torch.exp(-float(cyl_alpha) * signed)
         pen = torch.where(inside_z, pen, torch.zeros_like(pen))
         J = J + float(w_cyl) * torch.sum(pen, dim=1)
@@ -360,7 +367,7 @@ class TorchMPPIQuadOuter:
         if len(self.cyl) > 0:
             cx = torch.tensor([c["cx"] for c in self.cyl], device=self.device, dtype=torch.float32)
             cy = torch.tensor([c["cy"] for c in self.cyl], device=self.device, dtype=torch.float32)
-            r  = torch.tensor([c["r"]  for c in self.cyl], device=self.device, dtype=torch.float32)
+            r  = torch.tensor([STATIC_BUILDING_RADIUS_SCALE * c["r"] for c in self.cyl], device=self.device, dtype=torch.float32)
             zmin = torch.tensor([c.get("zmin", -1e9) for c in self.cyl], device=self.device, dtype=torch.float32)
             zmax = torch.tensor([c.get("zmax",  1e9) for c in self.cyl], device=self.device, dtype=torch.float32)
             self.cyl_t = (cx, cy, r, zmin, zmax)
@@ -502,53 +509,30 @@ def simulate(
         {"cx": -1.0, "cy":  4.0, "r": 0.7, "zmin": 0.0, "zmax": 4.5},
     ]
 
-    def reversed_shifted_waypoint_loop(
-        base_waypoints: np.ndarray,
-        start_shift: int,
-        z_offset: float,
-    ) -> np.ndarray:
-        loop = base_waypoints[:-1].copy()
-        reversed_loop = loop[::-1]
-        shifted = np.roll(reversed_loop, -start_shift, axis=0)
-        shifted[:, 2] = np.maximum(0.0, shifted[:, 2] + z_offset)
-        return np.vstack([shifted, shifted[0]])
+    traj = build_min_snap_3d(waypoints[::-1], avg_speed=1.8)
 
-    traj = build_min_snap_3d(waypoints, avg_speed=1.8)
-
-    # Moving Crazyflies use the ego drone loop as the base route, fly it in the
-    # reverse direction, start from different points, and separate vertically.
-    # XY is unchanged from the ego route so building clearance stays the same.
-    moving_start_shifts = (
-        0,
-        1,
-        2,
-        # 3,  # Obstacle 4, plotted as #FF8C00.
-        4,
-        5,
-    )
-    moving_z_offsets = np.array([
-        -0.15,
-        -0.09,
-        -0.03,
-        # 0.03,  # Obstacle 4, plotted as #FF8C00.
-        0.09,
-        0.15,
+    # Moving Crazyflies use the same waypoint loop, translated by small offsets
+    # so they fly on separated copies of the trajectory.
+    n_moving_obstacles = 4
+    moving_offsets = np.array([
+        [-0.25,  0.60, 0.00],
+        [-0.65, -0.45, 0.00],
+        [ 0.45, -0.60, 0.00],
+        [ 1.10,  0.60, 0.00],
     ], dtype=float)
     moving_waypoint_sets = [
-        reversed_shifted_waypoint_loop(waypoints, shift, z_offset)
-        for shift, z_offset in zip(moving_start_shifts, moving_z_offsets)
+        waypoints + moving_offsets[j][None, :]
+        for j in range(n_moving_obstacles)
     ]
-    moving_time_offsets = np.array([
+    moving_time_offsets = np.linspace(
         0.0,
-        1.5,
-        2.5,
-        # 3.5,  # Obstacle 4, plotted as #FF8C00.
-        5.0,
-        6.5,
-    ], dtype=float)
+        traj.total_time * (n_moving_obstacles - 1) / n_moving_obstacles,
+        n_moving_obstacles,
+        dtype=float,
+    )
 
     moving_trajs = [
-        build_min_snap_3d(wp, avg_speed=1.8)
+        build_min_snap_3d(wp, avg_speed=2.7)
         for wp in moving_waypoint_sets
     ]
     params = MPPIParams(
@@ -685,9 +669,14 @@ def simulate(
         for c in cylinders:
             dxy = float(np.hypot(float(p[0]) - c["cx"], float(p[1]) - c["cy"]))
             min_dist = min(min_dist, dxy)
-            if float(c.get("zmin", -1e9)) <= float(p[2]) <= float(c.get("zmax", 1e9)):
-                safety = safety or dxy < float(c["r"] + cyl_margin + drone_radius)
-                collision = collision or dxy < float(c["r"] + drone_radius)
+            building_r = STATIC_BUILDING_RADIUS_SCALE * float(c["r"])
+            z = float(p[2])
+            zmin = float(c.get("zmin", -1e9))
+            zmax = float(c.get("zmax", 1e9))
+            if zmin - drone_radius <= z <= zmax + drone_radius:
+                collision = collision or dxy < float(building_r + drone_radius)
+            if zmin - (drone_radius + cyl_margin) <= z <= zmax + (drone_radius + cyl_margin):
+                safety = safety or dxy < float(building_r + cyl_margin + drone_radius)
         return min_dist, safety, collision
     obs_update_steps = max(1, int(obs_update_steps))
     held_obs_seq = None

@@ -17,11 +17,8 @@ Row metrics:
 6) Global maximum of per-run maximum compute time
 7) Mean ± std of per-run maximum compute time
 
-python benchmark_mppi_stats.py \
-  --runs 30 \
-  --steps 900 \
-  --alpha 0.95 \
-  --outdir results_mppi_stats_paper
+
+python3 stats/benchmark_mppi_stats.py --runs 100 --steps 500 --outdir stats/results_mppi_stats_paper --use_gpu --scenario 2
 """
 
 from __future__ import annotations
@@ -53,7 +50,12 @@ MPPI_DIR = os.path.dirname(HERE)
 if MPPI_DIR not in sys.path:
     sys.path.insert(0, MPPI_DIR)
 
-from mppi_class import MPPI as PlainMPPIClass, RA_MPPI as RAMPPIClass, DR_MPPI as DRMPPIClass
+from mppi_class import (
+    MPPI as PlainMPPIClass,
+    RA_MPPI as RAMPPIClass,
+    DR_MPPI as DRMPPIClass,
+    DRA_MPPI as DRAMPPIClass,
+)
 import mppi as plain_mod
 import RA_mppi as ra_mod
 import DR_mppi as dr_mod
@@ -92,6 +94,41 @@ def all_obstacles_state(obs_csv, t_query: float) -> tuple[np.ndarray, np.ndarray
     return plain_mod.all_obstacles_state(obs_csv, t_query)
 
 
+class CachedMovingObstacleCSV:
+    """Cache per-timestamp obstacle frames for repeated stats episodes."""
+
+    def __init__(self, obs_csv):
+        self._obs_csv = obs_csv
+        self.df = obs_csv.df
+        self.times = np.asarray(obs_csv.times, dtype=float)
+        self._frames = {
+            float(t): frame.copy()
+            for t, frame in self.df.groupby("_tkey", sort=False)
+        }
+
+    def __getattr__(self, name):
+        return getattr(self._obs_csv, name)
+
+    def nearest_time(self, t_query: float) -> float:
+        t = float(t_query)
+        times = self.times
+        idx = int(np.searchsorted(times, t, side="left"))
+        if idx <= 0:
+            return float(times[0])
+        if idx >= len(times):
+            return float(times[-1])
+        before = float(times[idx - 1])
+        after = float(times[idx])
+        return before if abs(t - before) <= abs(after - t) else after
+
+    def obstacles_now(self, t_query: float) -> pd.DataFrame:
+        tkey = self.nearest_time(t_query)
+        frame = self._frames.get(tkey)
+        if frame is None:
+            return self._obs_csv.obstacles_now(t_query)
+        return frame.copy()
+
+
 def step_rng(run_seed: int, step_idx: int, stream_id: int) -> np.random.Generator:
     ss = np.random.SeedSequence([int(run_seed), int(step_idx), int(stream_id)])
     return np.random.default_rng(ss)
@@ -108,12 +145,17 @@ def make_obs_noise_cpu(run_seed: int, step_idx: int, noise_mode: str, T: int, K:
     return rng.standard_normal((T, K, N, 2), dtype=np.float32)
 
 
-def set_step_seed(run_seed: int, step_idx: int, alg_stream: int):
+def set_step_seed(run_seed: int, step_idx: int, alg_stream: int, ctrl=None):
     seed = int(step_rng(run_seed, step_idx, stream_id=alg_stream).integers(0, 2**31 - 1, dtype=np.int64))
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if ctrl is not None and hasattr(ctrl, "_rng"):
+        try:
+            ctrl._rng.manual_seed(seed)
+        except Exception:
+            pass
 
 
 def _fmt_mean_std(vals: np.ndarray, digits: int = 4) -> str:
@@ -124,6 +166,19 @@ def _fmt_mean_std(vals: np.ndarray, digits: int = 4) -> str:
     mean = float(np.mean(vals))
     std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
     return f"{mean:.{digits}f} ± ({std:.{digits}f})"
+
+
+def _fmt_duration(seconds: float) -> str:
+    if not np.isfinite(seconds) or seconds < 0.0:
+        return "unknown"
+    seconds_i = int(round(float(seconds)))
+    h, rem = divmod(seconds_i, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:d}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m:d}m {s:02d}s"
+    return f"{s:d}s"
 
 
 def _kde_pdf(x: np.ndarray, grid: np.ndarray) -> np.ndarray:
@@ -323,19 +378,18 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
     last_obs_update_k = -10**9
     next_obs_update_t = float(sim_time_grid[0])
 
-    if kind != "dra":
-        Q_t = torch.as_tensor(params["Q"], device=ctrl.device, dtype=ctrl.dtype)
-        R_t = torch.as_tensor(params["R"], device=ctrl.device, dtype=ctrl.dtype)
-        Qf_t = torch.as_tensor(params["Qf"], device=ctrl.device, dtype=ctrl.dtype)
-        y_min_t = torch.as_tensor(params["y_min_bound"], device=ctrl.device, dtype=ctrl.dtype)
-        y_max_t = torch.as_tensor(params["y_max_bound"], device=ctrl.device, dtype=ctrl.dtype)
-        path_xy_t = None
-        if scenario == 2 and params["ref_path_xypsi"] is not None:
-            path_xy_t = torch.as_tensor(
-                params["ref_path_xypsi"][:, :2],
-                device=ctrl.device,
-                dtype=ctrl.dtype,
-            )
+    Q_t = torch.as_tensor(params["Q"], device=ctrl.device, dtype=ctrl.dtype)
+    R_t = torch.as_tensor(params["R"], device=ctrl.device, dtype=ctrl.dtype)
+    Qf_t = torch.as_tensor(params["Qf"], device=ctrl.device, dtype=ctrl.dtype)
+    y_min_t = torch.as_tensor(params["y_min_bound"], device=ctrl.device, dtype=ctrl.dtype)
+    y_max_t = torch.as_tensor(params["y_max_bound"], device=ctrl.device, dtype=ctrl.dtype)
+    path_xy_t = None
+    if scenario == 2 and params["ref_path_xypsi"] is not None:
+        path_xy_t = torch.as_tensor(
+            params["ref_path_xypsi"][:, :2],
+            device=ctrl.device,
+            dtype=ctrl.dtype,
+        )
 
     for k in range(steps):
         t_now = float(sim_time_grid[k])
@@ -391,47 +445,46 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
             )
             ref = np.asarray(ref, dtype=np.float32)
 
-        if kind != "dra":
-            ctrl.cost_kwargs["ref"] = torch.as_tensor(ref, device=ctrl.device, dtype=ctrl.dtype)
-            ctrl.cost_kwargs["Q"] = Q_t
-            ctrl.cost_kwargs["R"] = R_t
-            ctrl.cost_kwargs["Qf"] = Qf_t
-            ctrl.cost_kwargs["y_min"] = y_min_t
-            ctrl.cost_kwargs["y_max"] = y_max_t
-            ctrl.cost_kwargs["boundary_w"] = params["boundary_w"]
-            ctrl.cost_kwargs["boundary_k"] = params["boundary_k"]
-            ctrl.cost_kwargs["boundary_d"] = params["boundary_d"]
-            if scenario == 2 and path_xy_t is not None:
-                ctrl.cost_kwargs["path_xy"] = path_xy_t
-                ctrl.cost_kwargs["path_boundary_w"] = params["path_boundary_w"]
-                ctrl.cost_kwargs["path_boundary_k"] = params["path_boundary_k"]
-                ctrl.cost_kwargs["path_corridor_radius"] = params["path_corridor_radius"]
-            else:
-                ctrl.cost_kwargs["path_xy"] = None
-                ctrl.cost_kwargs["path_boundary_w"] = 0.0
-                ctrl.cost_kwargs["path_boundary_k"] = params["path_boundary_k"]
-                ctrl.cost_kwargs["path_corridor_radius"] = params["path_corridor_radius"]
-            ctrl.cost_kwargs["obs_w"] = params["plain_obs_w"] if kind == "plain" else 0.0
-            if K > 0:
-                ctrl.cost_kwargs["O_mean"] = torch.as_tensor(O_mean, device=ctrl.device, dtype=ctrl.dtype)
-                ctrl.cost_kwargs["O_phi"] = torch.as_tensor(O_phi, device=ctrl.device, dtype=ctrl.dtype)
-                ctrl.cost_kwargs["radii"] = torch.as_tensor(radii_for_mppi, device=ctrl.device, dtype=ctrl.dtype)
-                ctrl.cost_kwargs["ego_half_length"] = float(params["ego_half_length"])
-                ctrl.cost_kwargs["ego_half_width"] = float(params["ego_half_width"])
-                ctrl.cost_kwargs["obs_half_length"] = float(params["obs_half_length"])
-                ctrl.cost_kwargs["obs_half_width"] = float(params["obs_half_width"])
-                ctrl.cost_kwargs["obstacle_buffer"] = float(params["plan_extra_margin"])
-            else:
-                ctrl.cost_kwargs["O_mean"] = None
-                ctrl.cost_kwargs["O_phi"] = None
-                ctrl.cost_kwargs["radii"] = None
-                ctrl.cost_kwargs["ego_half_length"] = None
-                ctrl.cost_kwargs["ego_half_width"] = None
-                ctrl.cost_kwargs["obs_half_length"] = None
-                ctrl.cost_kwargs["obs_half_width"] = None
-                ctrl.cost_kwargs["obstacle_buffer"] = 0.0
+        ctrl.cost_kwargs["ref"] = torch.as_tensor(ref, device=ctrl.device, dtype=ctrl.dtype)
+        ctrl.cost_kwargs["Q"] = Q_t
+        ctrl.cost_kwargs["R"] = R_t
+        ctrl.cost_kwargs["Qf"] = Qf_t
+        ctrl.cost_kwargs["y_min"] = y_min_t
+        ctrl.cost_kwargs["y_max"] = y_max_t
+        ctrl.cost_kwargs["boundary_w"] = params["boundary_w"]
+        ctrl.cost_kwargs["boundary_k"] = params["boundary_k"]
+        ctrl.cost_kwargs["boundary_d"] = params["boundary_d"]
+        if scenario == 2 and path_xy_t is not None:
+            ctrl.cost_kwargs["path_xy"] = path_xy_t
+            ctrl.cost_kwargs["path_boundary_w"] = params["path_boundary_w"]
+            ctrl.cost_kwargs["path_boundary_k"] = params["path_boundary_k"]
+            ctrl.cost_kwargs["path_corridor_radius"] = params["path_corridor_radius"]
+        else:
+            ctrl.cost_kwargs["path_xy"] = None
+            ctrl.cost_kwargs["path_boundary_w"] = 0.0
+            ctrl.cost_kwargs["path_boundary_k"] = params["path_boundary_k"]
+            ctrl.cost_kwargs["path_corridor_radius"] = params["path_corridor_radius"]
+        ctrl.cost_kwargs["obs_w"] = params["plain_obs_w"] if kind == "plain" else 0.0
+        if K > 0:
+            ctrl.cost_kwargs["O_mean"] = torch.as_tensor(O_mean, device=ctrl.device, dtype=ctrl.dtype)
+            ctrl.cost_kwargs["O_phi"] = torch.as_tensor(O_phi, device=ctrl.device, dtype=ctrl.dtype)
+            ctrl.cost_kwargs["radii"] = torch.as_tensor(radii_for_mppi, device=ctrl.device, dtype=ctrl.dtype)
+            ctrl.cost_kwargs["ego_half_length"] = float(params["ego_half_length"])
+            ctrl.cost_kwargs["ego_half_width"] = float(params["ego_half_width"])
+            ctrl.cost_kwargs["obs_half_length"] = float(params["obs_half_length"])
+            ctrl.cost_kwargs["obs_half_width"] = float(params["obs_half_width"])
+            ctrl.cost_kwargs["obstacle_buffer"] = float(params["plan_extra_margin"])
+        else:
+            ctrl.cost_kwargs["O_mean"] = None
+            ctrl.cost_kwargs["O_phi"] = None
+            ctrl.cost_kwargs["radii"] = None
+            ctrl.cost_kwargs["ego_half_length"] = None
+            ctrl.cost_kwargs["ego_half_width"] = None
+            ctrl.cost_kwargs["obs_half_length"] = None
+            ctrl.cost_kwargs["obs_half_width"] = None
+            ctrl.cost_kwargs["obstacle_buffer"] = 0.0
 
-        set_step_seed(run_seed, k, alg_stream=0)
+        set_step_seed(run_seed, k, alg_stream=0, ctrl=ctrl)
 
         t0 = time.perf_counter()
         if kind == "plain":
@@ -448,19 +501,7 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
             obs_noise_t = torch.as_tensor(obs_noise_cpu, device=ctrl.device, dtype=ctrl.dtype)
             U, _ = ctrl.plan(x, return_samples=False, obs_noise_std=obs_noise_t)
         elif kind == "dra":
-            U = ctrl.plan(
-                x0_cpu=x,
-                ref_cpu=ref,
-                O_mean_cpu=O_mean if K > 0 else None,
-                radii_cpu=radii_for_mppi,
-                O_phi_cpu=O_phi if K > 0 else None,
-                ego_half_length=float(params["ego_half_length"]),
-                ego_half_width=float(params["ego_half_width"]),
-                obs_half_length=float(params["obs_half_length"]),
-                obs_half_width=float(params["obs_half_width"]),
-                obstacle_buffer=float(params["plan_extra_margin"]),
-                return_samples=False,
-            )
+            U, _ = ctrl.plan(x, return_samples=False)
         else:
             raise ValueError(f"Unknown kind: {kind}")
         t1 = time.perf_counter()
@@ -550,7 +591,7 @@ def main():
     ap.add_argument(
         "--obs-update-steps",
         type=int,
-        default=20,
+        default=10,
         help=(
             "Read a fresh obstacle CSV sample every N control steps and hold that "
             "same obstacle observation between reads. Control dt is unchanged."
@@ -633,16 +674,16 @@ def main():
     R = np.array([0.004, 0.004], dtype=np.float32)
     cvar_N = 10
     ra_dr_obs_pos_sigma = (0.07, 0.07)
-    dr_eps_cvar = 0.05
+    dr_eps_cvar = 0.12
     obs_noise_mode = "per_step"
     risk_cost_A = 10.0
     risk_cost_Cu = 0.0
     plain_obs_w = 5e3
     dra_sigma_cp = 0.05
-    dra_Nmc = 2000
+    dra_Nmc = 10
     dra_omega_soft = 10.0
     dra_omega_hard = 1000.0
-    dra_obs_pos_sigma = (0.015, 0.015)
+    dra_obs_pos_sigma = (0.07, 0.07)
     dra_mc_chunk = 1000
 
     lane_psi = 0.0
@@ -861,40 +902,57 @@ def main():
                 **common_kwargs,
             )
         elif spec["kind"] == "dra":
-            ctrl = dra_mod.DRA_MPPI(
+            ctrl = DRAMPPIClass(
                 dt=dt,
                 T=T,
                 M=M,
                 lam=lam,
-                sigma=sigma,
-                Q=Q,
-                R=R,
-                Qf=Qf,
+                noise_sigma=sigma,
                 u_min=u_min,
                 u_max=u_max,
+                dynamics=dra_mod.dyn_diffdrive,
+                running_cost=dra_mod.running_cost_lane_obs,
+                terminal_cost=dra_mod.terminal_cost_track,
+                dyn_kwargs=dict(w_max=float(params["dyn_w_max"])),
+                cost_kwargs=dict(
+                    ref=torch.zeros(3, dtype=torch.float32, device=device),
+                    Q=torch.as_tensor(Q, dtype=torch.float32, device=device),
+                    R=torch.as_tensor(R, dtype=torch.float32, device=device),
+                    Qf=torch.as_tensor(Qf, dtype=torch.float32, device=device),
+                    O_mean=None,
+                    O_phi=None,
+                    radii=None,
+                    obs_w=0.0,
+                    ego_half_length=None,
+                    ego_half_width=None,
+                    obs_half_length=None,
+                    obs_half_width=None,
+                    obstacle_buffer=0.0,
+                    y_min=torch.as_tensor(y_min_bound, dtype=torch.float32, device=device),
+                    y_max=torch.as_tensor(y_max_bound, dtype=torch.float32, device=device),
+                    boundary_w=boundary_w,
+                    boundary_k=boundary_k,
+                    boundary_d=boundary_d,
+                    path_xy=(
+                        torch.as_tensor(ref_path_xypsi[:, :2], dtype=torch.float32, device=device)
+                        if scenario == 2 and ref_path_xypsi is not None
+                        else None
+                    ),
+                    path_corridor_radius=path_corridor_radius,
+                    path_boundary_w=path_boundary_w if scenario == 2 and ref_path_xypsi is not None else 0.0,
+                    path_boundary_k=path_boundary_k,
+                    mc_chunk=dra_mc_chunk,
+                ),
                 sigma_cp=dra_sigma_cp,
                 Nmc=dra_Nmc,
                 omega_soft=dra_omega_soft,
                 omega_hard=dra_omega_hard,
                 obs_pos_sigma=dra_obs_pos_sigma,
-                mc_chunk=dra_mc_chunk,
                 seed=int(args.seed),
                 device=device,
                 dtype=torch.float32,
+                verbose=False,
             )
-            ctrl.y_min = torch.as_tensor(y_min_bound, device=ctrl.device, dtype=ctrl.dtype)
-            ctrl.y_max = torch.as_tensor(y_max_bound, device=ctrl.device, dtype=ctrl.dtype)
-            ctrl.boundary_w = boundary_w
-            ctrl.boundary_k = boundary_k
-            ctrl.boundary_d = boundary_d
-            ctrl._boundary_w_t = torch.as_tensor(boundary_w, device=ctrl.device, dtype=ctrl.dtype)
-            ctrl.path_xy = None
-            ctrl.path_boundary_w = 0.0
-            ctrl.path_boundary_k = path_boundary_k
-            ctrl.path_corridor_radius = path_corridor_radius
-            if scenario == 2 and ref_path_xypsi is not None:
-                ctrl.path_xy = torch.as_tensor(ref_path_xypsi[:, :2], device=ctrl.device, dtype=ctrl.dtype)
-                ctrl.path_boundary_w = path_boundary_w
         else:
             raise RuntimeError("Unknown controller spec")
         controllers.append((spec, ctrl))
@@ -912,10 +970,15 @@ def main():
             run_max_compute_time_s=[],
         )
 
+    benchmark_t0 = time.perf_counter()
+    total_episodes = int(args.runs) * len(controllers)
+    completed_episodes = 0
+
     for r in range(args.runs):
         run_seed = int(run_seeds[r])
         print(f"[run {r + 1:3d}/{args.runs}] started (seed={run_seed})", flush=True)
         for spec, ctrl in controllers:
+            episode_t0 = time.perf_counter()
             print(f"  [controller] {spec['name']} ...", flush=True)
             ctrl.U[:] = 0.0
             ctrl.U[-1] = np.array([v_des, 0.0], dtype=np.float32)
@@ -940,9 +1003,24 @@ def main():
             rec["safety_violation"].append(1.0 if safety_violated else 0.0)
             rec["collision"].append(1.0 if collided else 0.0)
             rec["run_max_compute_time_s"].append(max_compute_s)
+
+            completed_episodes += 1
+            elapsed_s = time.perf_counter() - benchmark_t0
+            episode_s = time.perf_counter() - episode_t0
+            avg_episode_s = elapsed_s / max(completed_episodes, 1)
+            remaining_episodes = max(total_episodes - completed_episodes, 0)
+            remaining_s = avg_episode_s * remaining_episodes
+            eta_wall = time.time() + remaining_s
+            eta_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(eta_wall))
             print(
                 f"  [done] {spec['name']}: cost={total_qr_cost:.4f}, "
                 f"min_dist={run_min_d:.4f}, collided={int(collided)}",
+                flush=True,
+            )
+            print(
+                f"  [eta] completed={completed_episodes}/{total_episodes}, "
+                f"last={_fmt_duration(episode_s)}, elapsed={_fmt_duration(elapsed_s)}, "
+                f"remaining~{_fmt_duration(remaining_s)}, finish~{eta_text}",
                 flush=True,
             )
 
@@ -962,6 +1040,7 @@ def main():
                     Collision=rec["collision"][i],
                     # Keep legacy column name for compatibility with existing plot scripts.
                     TotalQSigmaInvStageCost=rec["total_qr_cost"][i],
+                    TotalQRStageCost=rec["total_qr_cost"][i],
                     RunMaxComputeTimeMs=1000.0 * rec["run_max_compute_time_s"][i],
                 )
             )
@@ -1025,6 +1104,8 @@ def main():
                 RunMinDistance_Std=float(np.std(run_min_f, ddof=1)) if len(run_min_f) > 1 else 0.0,
                 SafetyViolation_Prob=float(np.mean(safety)),
                 Collision_Prob=float(np.mean(coll)),
+                TotalQRStageCost_Mean=float(np.mean(costs)),
+                TotalQRStageCost_Std=float(np.std(costs, ddof=1)) if len(costs) > 1 else 0.0,
                 TotalQSigmaInvStageCost_Mean=float(np.mean(costs)),
                 TotalQSigmaInvStageCost_Std=float(np.std(costs, ddof=1)) if len(costs) > 1 else 0.0,
                 RunMaxComputeTimeMs_Max=float(np.max(tmax_ms)) if len(tmax_ms) > 0 else np.nan,

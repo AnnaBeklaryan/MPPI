@@ -333,6 +333,22 @@ def _build_plotly_figure(method: str, data: dict[str, np.ndarray], with_predicti
         c = obs_colors[j % len(obs_colors)]
         fig.add_trace(_sphere_mesh_trace(obs_path[0, j, :], obstacle_radius, c, name=f"Obstacle {j + 1} radius", showlegend=True, opacity=0.09))
         dynamic_trace_idx.append(len(fig.data) - 1)
+    for j in range(n_obs):
+        po = obs_path[0, j, :]
+        fig.add_trace(
+            go.Scatter3d(
+                x=[po[0]],
+                y=[po[1]],
+                z=[po[2] + 0.35],
+                mode="text",
+                text=[f"obs {j}"],
+                textfont=dict(color="#111111", size=14),
+                name="Obstacle index" if j == 0 else None,
+                showlegend=(j == 0),
+                hoverinfo="skip",
+            )
+        )
+        dynamic_trace_idx.append(len(fig.data) - 1)
 
     pred_count = int(pred_samples.shape[2]) if pred_samples is not None else 0
     for j in range(pred_count):
@@ -448,6 +464,16 @@ def _build_plotly_figure(method: str, data: dict[str, np.ndarray], with_predicti
             frame_data.append(go.Scatter3d(x=[op2a[0], op2b[0]], y=[op2a[1], op2b[1]], z=[op2a[2], op2b[2]]))
         for j in range(n_obs):
             frame_data.append(_sphere_mesh_trace(obs_path[i, j, :], obstacle_radius, obs_colors[j % len(obs_colors)], opacity=0.09))
+        for j in range(n_obs):
+            po = obs_path[i, j, :]
+            frame_data.append(
+                go.Scatter3d(
+                    x=[po[0]],
+                    y=[po[1]],
+                    z=[po[2] + 0.35],
+                    text=[f"obs {j}"],
+                )
+            )
 
         for j in range(pred_count):
             pred_xyz = pred_samples[i, :, j, :]
@@ -632,6 +658,22 @@ def _build_compare_figure(all_data: dict[str, dict[str, np.ndarray]]) -> go.Figu
         c = obs_colors[j % len(obs_colors)]
         fig.add_trace(_sphere_mesh_trace(obs_path[0, j, :], obstacle_radius, c, name=f"Obstacle {j + 1} radius", showlegend=True, opacity=0.08))
         dynamic_trace_idx.append(len(fig.data) - 1)
+    for j in range(n_obs):
+        po = obs_path[0, j, :]
+        fig.add_trace(
+            go.Scatter3d(
+                x=[po[0]],
+                y=[po[1]],
+                z=[po[2] + 0.35],
+                mode="text",
+                text=[f"obs {j}"],
+                textfont=dict(color="#111111", size=14),
+                name="Obstacle index" if j == 0 else None,
+                showlegend=(j == 0),
+                hoverinfo="skip",
+            )
+        )
+        dynamic_trace_idx.append(len(fig.data) - 1)
 
     drone_colors = {
         "mppi": "#095ed5",
@@ -705,6 +747,16 @@ def _build_compare_figure(all_data: dict[str, dict[str, np.ndarray]]) -> go.Figu
             frame_data.append(go.Scatter3d(x=[op2a[0], op2b[0]], y=[op2a[1], op2b[1]], z=[op2a[2], op2b[2]]))
         for j in range(n_obs):
             frame_data.append(_sphere_mesh_trace(obs_path[i, j, :], obstacle_radius, obs_colors[j % len(obs_colors)], opacity=0.08))
+        for j in range(n_obs):
+            po = obs_path[i, j, :]
+            frame_data.append(
+                go.Scatter3d(
+                    x=[po[0]],
+                    y=[po[1]],
+                    z=[po[2] + 0.35],
+                    text=[f"obs {j}"],
+                )
+            )
         for m in methods:
             xp = x_paths[m]
             frame_data.append(go.Scatter3d(x=xp[: i + 1, 0], y=xp[: i + 1, 1], z=xp[: i + 1, 2]))

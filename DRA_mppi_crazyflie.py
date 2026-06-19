@@ -176,6 +176,9 @@ def _wrap_pi_torch(a: torch.Tensor) -> torch.Tensor:
     return (a + torch.pi) % (2.0 * torch.pi) - torch.pi
 
 
+STATIC_BUILDING_RADIUS_SCALE = math.sqrt(2.0)
+
+
 def _z_body_world_torch(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
     croll = torch.cos(roll); sroll = torch.sin(roll)
     cpitch = torch.cos(pitch); spitch = torch.sin(pitch)
@@ -231,12 +234,6 @@ def running_cost_quad(
     w_cyl: float = 350.0,
     cyl_safety_margin: float = 0.25,
     cyl_alpha: float = 10.0,
-    # moving mean (3D) soft cost
-    obs_mean_3d: torch.Tensor | None = None,   # (T+1,3)
-    w_moving: float = 800.0,
-    moving_r: float = 0.35,
-    moving_safety_margin: float = 0.50,
-    moving_alpha: float = 12.0,
     drone_radius: float = 0.0,
     U_nom: torch.Tensor | None = None,  # (T,4)
     Rd: torch.Tensor | None = None,     # (4,)
@@ -263,29 +260,14 @@ def running_cost_quad(
         d_xy = torch.sqrt(dx * dx + dy * dy)
         signed = d_xy - (cyl_r[None, :] + float(cyl_safety_margin) + float(drone_radius))
 
-        inside_z = (pz >= cyl_zmin[None, :]) & (pz <= cyl_zmax[None, :])
+        z_gate_margin = float(cyl_safety_margin) + float(drone_radius)
+        inside_z = (
+            (pz >= (cyl_zmin[None, :] - z_gate_margin))
+            & (pz <= (cyl_zmax[None, :] + z_gate_margin))
+        )
         pen = torch.exp(-float(cyl_alpha) * signed)
         pen = torch.where(inside_z, pen, torch.zeros_like(pen))
         J = J + float(w_cyl) * torch.sum(pen, dim=1)
-
-    # moving mean soft cost (true 3D dist). Match the collision checker's
-    # effective center-to-center radius: obstacle radius + ego drone radius.
-    if obs_mean_3d is not None:
-        moving_cost_radius = float(moving_r) + float(moving_safety_margin) + float(drone_radius)
-        if obs_mean_3d.ndim == 2:
-            obs = obs_mean_3d[t + 1]  # (3,)
-            d = X[:, 0:3] - obs[None, :]
-            dist = torch.sqrt(torch.sum(d * d, dim=1))
-            signed = dist - moving_cost_radius
-            pen = torch.exp(-float(moving_alpha) * signed)
-            J = J + float(w_moving) * pen
-        elif obs_mean_3d.ndim == 3:
-            obs = obs_mean_3d[t + 1]  # (K,3)
-            d = X[:, None, 0:3] - obs[None, :, :]
-            dist = torch.sqrt(torch.sum(d * d, dim=2))
-            signed = dist - moving_cost_radius
-            pen = torch.exp(-float(moving_alpha) * signed)
-            J = J + float(w_moving) * torch.sum(pen, dim=1)
 
     return J
 
@@ -323,11 +305,9 @@ class DRAParams:
     cyl_safety_margin: float = 0.25
     cyl_alpha: float = 10.0
 
-    # moving mean soft cost
-    w_moving: float = 800.0
+    # moving obstacle geometry for DRA risk
     moving_r: float = 0.35
     moving_safety_margin: float = 0.50
-    moving_alpha: float = 12.0
 
     # DRA risk terms
     sigma_cp: float = 0.05
@@ -378,7 +358,7 @@ class TorchDRAMPPIQuadOuter:
         if len(cyl) > 0:
             self.cyl_cx = torch.tensor([c["cx"] for c in cyl], device=self.device, dtype=torch.float32)
             self.cyl_cy = torch.tensor([c["cy"] for c in cyl], device=self.device, dtype=torch.float32)
-            self.cyl_r = torch.tensor([c["r"] for c in cyl], device=self.device, dtype=torch.float32)
+            self.cyl_r = torch.tensor([STATIC_BUILDING_RADIUS_SCALE * c["r"] for c in cyl], device=self.device, dtype=torch.float32)
             self.cyl_zmin = torch.tensor([c.get("zmin", -1e9) for c in cyl], device=self.device, dtype=torch.float32)
             self.cyl_zmax = torch.tensor([c.get("zmax", 1e9) for c in cyl], device=self.device, dtype=torch.float32)
         else:
@@ -418,10 +398,8 @@ class TorchDRAMPPIQuadOuter:
                 w_cyl=float(self.p.w_cyl),
                 cyl_safety_margin=float(self.p.cyl_safety_margin),
                 cyl_alpha=float(self.p.cyl_alpha),
-                w_moving=float(self.p.w_moving),
                 moving_r=float(self.p.moving_r),
                 moving_safety_margin=float(self.p.moving_safety_margin),
-                moving_alpha=float(self.p.moving_alpha),
                 U_nom=None,
                 Rd=None,
                 drone_radius=float(self.p.drone_radius),
@@ -538,53 +516,30 @@ def simulate(
         {"cx": -1.0, "cy":  4.0, "r": 0.7, "zmin": 0.0, "zmax": 4.5},
     ]
 
-    def reversed_shifted_waypoint_loop(
-        base_waypoints: np.ndarray,
-        start_shift: int,
-        z_offset: float,
-    ) -> np.ndarray:
-        loop = base_waypoints[:-1].copy()
-        reversed_loop = loop[::-1]
-        shifted = np.roll(reversed_loop, -start_shift, axis=0)
-        shifted[:, 2] = np.maximum(0.0, shifted[:, 2] + z_offset)
-        return np.vstack([shifted, shifted[0]])
+    traj = build_min_snap_3d(waypoints[::-1], avg_speed=1.8)
 
-    traj = build_min_snap_3d(waypoints, avg_speed=1.8)
-
-    # Moving Crazyflies use the ego drone loop as the base route, fly it in the
-    # reverse direction, start from different points, and separate vertically.
-    # XY is unchanged from the ego route so building clearance stays the same.
-    moving_start_shifts = (
-        0,
-        1,
-        2,
-        # 3,  # Obstacle 4, plotted as #FF8C00.
-        4,
-        5,
-    )
-    moving_z_offsets = np.array([
-        -0.15,
-        -0.09,
-        -0.03,
-        # 0.03,  # Obstacle 4, plotted as #FF8C00.
-        0.09,
-        0.15,
+    # Moving Crazyflies use the same waypoint loop, translated by small offsets
+    # so they fly on separated copies of the trajectory.
+    n_moving_obstacles = 4
+    moving_offsets = np.array([
+        [-0.25,  0.60, 0.00],
+        [-0.65, -0.45, 0.00],
+        [ 0.45, -0.60, 0.00],
+        [ 0.75,  0.35, 0.00],
     ], dtype=float)
     moving_waypoint_sets = [
-        reversed_shifted_waypoint_loop(waypoints, shift, z_offset)
-        for shift, z_offset in zip(moving_start_shifts, moving_z_offsets)
+        waypoints + moving_offsets[j][None, :]
+        for j in range(n_moving_obstacles)
     ]
-    moving_time_offsets = np.array([
+    moving_time_offsets = np.linspace(
         0.0,
-        1.5,
-        2.5,
-        # 3.5,  # Obstacle 4, plotted as #FF8C00.
-        5.0,
-        6.5,
-    ], dtype=float)
+        traj.total_time * (n_moving_obstacles - 1) / n_moving_obstacles,
+        n_moving_obstacles,
+        dtype=float,
+    )
 
     moving_trajs = [
-        build_min_snap_3d(wp, avg_speed=1.8)
+        build_min_snap_3d(wp, avg_speed=2.7)
         for wp in moving_waypoint_sets
     ]
 
@@ -610,19 +565,17 @@ def simulate(
             dtype=np.float32,
         ),
 
-        w_cyl=510.6988597095838,
-        cyl_safety_margin=0.2150292356967072,
-        cyl_alpha=8.72155294537059,
+        w_cyl=80,
+        cyl_safety_margin=0.215,
+        cyl_alpha=5.,
 
-        w_moving=376.5800114691624,
-        moving_r=0.3045201563139591,
-        moving_safety_margin=0.0,
-        moving_alpha=15.033309531167399,
+        moving_r=0.304,
+        moving_safety_margin=0.,
 
-        sigma_cp=0.05,
-        Nmc=30,
+        sigma_cp=0.0,
+        Nmc=50,
         omega_soft=10.0,
-        omega_hard=1000.0,
+        omega_hard=600.0,
         obs_pos_sigma_xyz=(0.1, 0.1, 0.1),
         mc_chunk=1000,
         
@@ -733,9 +686,14 @@ def simulate(
         for c in cylinders:
             dxy = float(np.hypot(float(pos[0]) - c["cx"], float(pos[1]) - c["cy"]))
             min_dist = min(min_dist, dxy)
-            if float(c.get("zmin", -1e9)) <= float(pos[2]) <= float(c.get("zmax", 1e9)):
-                safety = safety or dxy < float(c["r"] + cyl_margin + drone_radius)
-                collision = collision or dxy < float(c["r"] + drone_radius)
+            building_r = STATIC_BUILDING_RADIUS_SCALE * float(c["r"])
+            z = float(pos[2])
+            zmin = float(c.get("zmin", -1e9))
+            zmax = float(c.get("zmax", 1e9))
+            if zmin - drone_radius <= z <= zmax + drone_radius:
+                collision = collision or dxy < float(building_r + drone_radius)
+            if zmin - (drone_radius + cyl_margin) <= z <= zmax + (drone_radius + cyl_margin):
+                safety = safety or dxy < float(building_r + cyl_margin + drone_radius)
         return min_dist, safety, collision
     obs_update_steps = max(1, int(obs_update_steps))
     held_obs_seq = None

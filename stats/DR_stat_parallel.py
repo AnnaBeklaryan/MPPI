@@ -6,7 +6,7 @@ This script keeps the original DR_stat.py behavior and outputs, but runs
 independent epsilon values in parallel on CPU workers.
 
 Example:
-    python3 stats/DR_stat_parallel.py --scenario 2 --runs 100 --steps 700 --eps-max 0.1 --eps-step 0.001 --workers 8
+python3 stats/DR_stat_parallel.py   --scenario 2   --runs 100   --steps 500   --eps-max 0.1   --eps-step 0.001   --workers 15   --outdir results_dr_eps_stats_rect  --use_gpu
 """
 
 from __future__ import annotations
@@ -104,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         help="Also save the collision-probability plot as PDF.",
     )
     ap.add_argument(
+        "--append",
+        action="store_true",
+        help="Append completed epsilon results to existing CSV files instead of rewriting them.",
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         default=0,
@@ -131,6 +136,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return ap.parse_args()
+
+
+RUN_COLUMNS = [
+    "epsilon",
+    "Run",
+    "Seed",
+    "RunMinDistance",
+    "SafetyViolation",
+    "Collision",
+    "TotalQRCost",
+    "RunMaxComputeTimeMs",
+]
+
+SUMMARY_COLUMNS = [
+    "epsilon",
+    "collision_prob",
+    "collision_free_prob",
+    "safety_violation_prob",
+    "run_min_distance_min",
+    "run_min_distance_mean",
+    "run_min_distance_std",
+    "total_qr_cost_mean",
+    "total_qr_cost_std",
+    "run_max_compute_time_ms_mean",
+    "run_max_compute_time_ms_std",
+]
 
 
 def _choose_workers(args: argparse.Namespace, num_eps: int) -> int:
@@ -204,6 +235,7 @@ def _build_worker_context(args_dict: dict[str, Any], torch_threads: int = 0, qui
             obs_csv, sim_time_grid, params, common_kwargs, _device, dr_cfg = serial_dr.build_sim_setup(args)
     else:
         obs_csv, sim_time_grid, params, common_kwargs, _device, dr_cfg = serial_dr.build_sim_setup(args)
+    obs_csv = bench.CachedMovingObstacleCSV(obs_csv)
     return dict(
         alpha=float(args.alpha),
         runs=int(args.runs),
@@ -249,6 +281,36 @@ def _summarize_one_epsilon(eps: float, run_rows: list[dict[str, Any]]) -> dict[s
         total_qr_cost_std=float(np.std(total_qr_cost, ddof=1)) if len(total_qr_cost) > 1 else 0.0,
         run_max_compute_time_ms_mean=float(np.mean(tmax)) if len(tmax) > 0 else np.nan,
         run_max_compute_time_ms_std=float(np.std(tmax, ddof=1)) if len(tmax) > 1 else 0.0,
+    )
+
+
+def _init_csv_outputs(run_csv: Path, summary_csv: Path) -> None:
+    pd.DataFrame(columns=RUN_COLUMNS).to_csv(run_csv, index=False)
+    pd.DataFrame(columns=SUMMARY_COLUMNS).to_csv(summary_csv, index=False)
+
+
+def _read_csv_if_exists(path: Path, columns: list[str]) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=columns)
+    df = pd.read_csv(path)
+    for col in columns:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df[columns].copy()
+
+
+def _append_result_to_csv(result: dict[str, Any], run_csv: Path, summary_csv: Path) -> None:
+    pd.DataFrame(result["run_rows"], columns=RUN_COLUMNS).to_csv(
+        run_csv,
+        mode="a",
+        header=False,
+        index=False,
+    )
+    pd.DataFrame([result["summary_row"]], columns=SUMMARY_COLUMNS).to_csv(
+        summary_csv,
+        mode="a",
+        header=False,
+        index=False,
     )
 
 
@@ -369,6 +431,17 @@ def main() -> None:
     args = parse_args()
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    run_csv = outdir / "dr_epsilon_run_metrics.csv"
+    summary_csv = outdir / "dr_epsilon_summary.csv"
+    if bool(args.append):
+        if not run_csv.exists():
+            pd.DataFrame(columns=RUN_COLUMNS).to_csv(run_csv, index=False)
+        if not summary_csv.exists():
+            pd.DataFrame(columns=SUMMARY_COLUMNS).to_csv(summary_csv, index=False)
+        print(f"[csv] append=1 keeping existing rows in {outdir}", flush=True)
+    else:
+        _init_csv_outputs(run_csv, summary_csv)
+        print(f"[csv] append=0 rewriting CSV outputs in {outdir}", flush=True)
 
     eps_sweep = serial_dr.build_epsilon_sweep(args)
     workers = _choose_workers(args=args, num_eps=len(eps_sweep))
@@ -428,6 +501,7 @@ def main() -> None:
             )
             result["elapsed_total_s"] = float(time.perf_counter() - sweep_t0)
             results.append(result)
+            _append_result_to_csv(result, run_csv, summary_csv)
             _log_one_result(result=result, done_count=idx, total_count=len(eps_sweep))
     else:
         ctx = mp.get_context("spawn")
@@ -453,17 +527,21 @@ def main() -> None:
                 result["elapsed_total_s"] = float(time.perf_counter() - sweep_t0)
                 results.append(result)
                 done_count += 1
+                _append_result_to_csv(result, run_csv, summary_csv)
                 _log_one_result(result=result, done_count=done_count, total_count=len(eps_sweep))
 
     results.sort(key=lambda item: float(item["epsilon"]))
-    run_rows = [row for result in results for row in result["run_rows"]]
-    summary_rows = [result["summary_row"] for result in results]
+    if bool(args.append):
+        run_df = _read_csv_if_exists(run_csv, RUN_COLUMNS)
+        summary_df = _read_csv_if_exists(summary_csv, SUMMARY_COLUMNS)
+    else:
+        run_rows = [row for result in results for row in result["run_rows"]]
+        summary_rows = [result["summary_row"] for result in results]
+        run_df = pd.DataFrame(run_rows, columns=RUN_COLUMNS)
+        summary_df = pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS)
 
-    run_df = pd.DataFrame(run_rows).sort_values(["epsilon", "Run"]).reset_index(drop=True)
-    summary_df = pd.DataFrame(summary_rows).sort_values("epsilon").reset_index(drop=True)
-
-    run_csv = outdir / "dr_epsilon_run_metrics.csv"
-    summary_csv = outdir / "dr_epsilon_summary.csv"
+    run_df = run_df.sort_values(["epsilon", "Run"]).reset_index(drop=True)
+    summary_df = summary_df.sort_values("epsilon").reset_index(drop=True)
     run_df.to_csv(run_csv, index=False)
     summary_df.to_csv(summary_csv, index=False)
 

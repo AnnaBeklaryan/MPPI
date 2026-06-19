@@ -3,7 +3,9 @@
 Parallel epsilon sweep for DR_mppi_crazyflie.py.
 
 Example:
-    python3 stats/DR_stat_cf_parallel.py --runs 10 --eps-min 0.02 --eps-max 0.1 --eps-step 0.01 --workers 8 --obs-update-steps 30 --steps 400
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.5 --eps-step 0.005 --workers 15 --obs-update-steps 15 --steps 400 --use_gpu
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.505 --eps-max 1.0 --eps-step 0.005 --workers 15 --obs-update-steps 15 --steps 400 --append
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.505 --eps-max 1 --eps-step 0.005 --workers 15 --obs-update-steps 15 --steps 400 --append true
 """
 
 from __future__ import annotations
@@ -56,12 +58,31 @@ SUMMARY_COLUMNS = [
 ]
 
 
+def _str_to_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    value_l = str(value).strip().lower()
+    if value_l in ("1", "true", "yes", "y", "on"):
+        return True
+    if value_l in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected true/false, got {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Run DR-MPPI Crazyflie epsilon statistics in parallel.")
     ap.add_argument("--runs", type=int, default=50, help="Number of repeated simulations per epsilon.")
     ap.add_argument("--outdir", type=str, default="results_dr_cf_eps_stats")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--use_gpu", action="store_true")
+    ap.add_argument(
+        "--append",
+        type=_str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Append new epsilon results to existing CSV files instead of rewriting them. Accepts true/false.",
+    )
     ap.add_argument(
         "--epsilons",
         type=float,
@@ -75,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--obs-update-steps",
         type=int,
-        default=35,
+        default=15,
         help="Read fresh moving-obstacle observations every N control steps and hold between reads.",
     )
     ap.add_argument(
@@ -310,6 +331,16 @@ def _init_csv_outputs(run_csv: Path, summary_csv: Path) -> None:
     pd.DataFrame(columns=SUMMARY_COLUMNS).to_csv(summary_csv, index=False)
 
 
+def _read_csv_if_exists(path: Path, columns: list[str]) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=columns)
+    df = pd.read_csv(path)
+    for col in columns:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df[columns].copy()
+
+
 def _append_result_to_csv(result: dict[str, Any], run_csv: Path, summary_csv: Path) -> None:
     pd.DataFrame(result["run_rows"], columns=RUN_COLUMNS).to_csv(
         run_csv,
@@ -331,7 +362,13 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     run_csv = outdir / "dr_cf_epsilon_run_metrics.csv"
     summary_csv = outdir / "dr_cf_epsilon_summary.csv"
-    _init_csv_outputs(run_csv, summary_csv)
+    if bool(args.append):
+        if not run_csv.exists() or not summary_csv.exists():
+            _init_csv_outputs(run_csv, summary_csv)
+        print(f"[csv] append=1 keeping existing rows in {outdir}", flush=True)
+    else:
+        _init_csv_outputs(run_csv, summary_csv)
+        print(f"[csv] append=0 rewriting CSV outputs in {outdir}", flush=True)
 
     eps_sweep = build_epsilon_sweep(args)
     workers = _choose_workers(args, num_eps=len(eps_sweep))
@@ -394,10 +431,17 @@ def main() -> None:
                 _log_one_result(result, done_count=done_count, total_count=len(eps_sweep))
 
     results.sort(key=lambda item: float(item["epsilon"]))
-    run_rows = [row for result in results for row in result["run_rows"]]
-    summary_rows = [result["summary_row"] for result in results]
-    run_df = pd.DataFrame(run_rows, columns=RUN_COLUMNS).sort_values(["epsilon", "Run"]).reset_index(drop=True)
-    summary_df = pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS).sort_values("epsilon").reset_index(drop=True)
+    if bool(args.append):
+        run_df = _read_csv_if_exists(run_csv, RUN_COLUMNS)
+        summary_df = _read_csv_if_exists(summary_csv, SUMMARY_COLUMNS)
+    else:
+        run_rows = [row for result in results for row in result["run_rows"]]
+        summary_rows = [result["summary_row"] for result in results]
+        run_df = pd.DataFrame(run_rows, columns=RUN_COLUMNS)
+        summary_df = pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS)
+
+    run_df = run_df.sort_values(["epsilon", "Run"]).reset_index(drop=True)
+    summary_df = summary_df.sort_values("epsilon").reset_index(drop=True)
 
     run_df.to_csv(run_csv, index=False)
     summary_df.to_csv(summary_csv, index=False)

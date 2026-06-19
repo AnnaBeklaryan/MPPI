@@ -7,7 +7,7 @@ mppi.py (Torch)
 - No CuPy import here
 
 Run:
-    python3 mppi.py  --obs-update-steps 20 --scenario 2 --save
+    python3 mppi.py  --obs-update-steps 10 --scenario 2 --save
 
 """
 

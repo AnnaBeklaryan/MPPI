@@ -11,11 +11,7 @@ Outputs:
 - summary_table_numeric.csv
 - run_metrics.csv
 
-python benchmark_crazyflie_stats.py \
-  --runs 30 \
-  --steps 550 \
-  --alpha 0.95 \
-  --outdir results_crazyflie_stats_paper
+ython3 stats/benchmark_crazyflie_stats.py   --runs 100   --steps 400   --outdir stats/results_crazyflie_stats_paper   --use_gpu
 
 """
 
@@ -31,6 +27,8 @@ import warnings
 import numpy as np
 import pandas as pd
 import torch
+
+STATIC_BUILDING_RADIUS_SCALE = math.sqrt(2.0)
 
 warnings.filterwarnings(
     "ignore",
@@ -95,17 +93,24 @@ def build_ref_and_obs_seq(
     lead_time: float,
     last_yaw_ref: float,
     moving_time_offsets=None,
+    moving_initial_advance: float = 0.0,
 ):
     ref_seq = np.zeros((T + 1, 4), dtype=float)
 
-    p0, v0 = traj.eval(min(t_now, traj.total_time))
+    def eval_loop(traj_obj, t_raw: float):
+        if t_raw <= 0.0:
+            return traj_obj.eval(0.0)
+        loop_T = max(1e-9, float(traj_obj.total_time))
+        return traj_obj.eval(float(t_raw) % loop_T)
+
+    p0, v0 = eval_loop(traj, t_now)
     psi0_raw = wrap_pi(yaw_follow_from_vel(v0, last_yaw_ref))
     ref_seq[0, 0:3] = p0
     ref_seq[0, 3] = last_yaw_ref + wrap_pi(psi0_raw - last_yaw_ref)
 
     for k in range(1, T + 1):
-        tk = min(traj.total_time, t_now + k * dt)
-        pk, vk = traj.eval(tk)
+        tk = t_now + k * dt
+        pk, vk = eval_loop(traj, tk)
         psi_raw = wrap_pi(yaw_follow_from_vel(vk, ref_seq[k - 1, 3]))
         prev = ref_seq[k - 1, 3]
         ref_seq[k, 0:3] = pk
@@ -121,15 +126,15 @@ def build_ref_and_obs_seq(
         obs_seq = np.zeros((T + 1, 3), dtype=float)
         moving_traj = moving_traj_list[0]
         for k in range(T + 1):
-            tk = min(moving_traj.total_time, max(0.0, t_now + lead_time + k * dt - float(moving_time_offsets[0])))
-            op, _ = moving_traj.eval(tk)
+            tk = t_now + lead_time + moving_initial_advance + k * dt - float(moving_time_offsets[0])
+            op, _ = eval_loop(moving_traj, tk)
             obs_seq[k] = op
     else:
         obs_seq = np.zeros((T + 1, len(moving_traj_list), 3), dtype=float)
         for j, moving_traj in enumerate(moving_traj_list):
             for k in range(T + 1):
-                tk = min(moving_traj.total_time, max(0.0, t_now + lead_time + k * dt - float(moving_time_offsets[j])))
-                op, _ = moving_traj.eval(tk)
+                tk = t_now + lead_time + moving_initial_advance + k * dt - float(moving_time_offsets[j])
+                op, _ = eval_loop(moving_traj, tk)
                 obs_seq[k, j] = op
 
     return ref_seq, obs_seq, float(ref_seq[1, 3])
@@ -143,15 +148,15 @@ def eval_stage_cost(x: np.ndarray, u: np.ndarray, ref: np.ndarray, Q: np.ndarray
 
 
 def effective_control_weight(ctrl) -> np.ndarray:
+    if hasattr(ctrl, "R_np"):
+        return np.asarray(ctrl.R_np, dtype=float).reshape(4,)
+    if hasattr(ctrl, "R"):
+        return np.asarray(ctrl.R, dtype=float).reshape(4,)
     sigma = getattr(getattr(ctrl, "p", None), "sigma", None)
     if sigma is not None:
         sigma = np.asarray(sigma, dtype=float).reshape(-1)
         if sigma.shape == (4,):
             return 1.0 / np.maximum(sigma ** 2, 1e-12)
-    if hasattr(ctrl, "R_np"):
-        return np.asarray(ctrl.R_np, dtype=float).reshape(4,)
-    if hasattr(ctrl, "R"):
-        return np.asarray(ctrl.R, dtype=float).reshape(4,)
     raise AttributeError("Controller does not expose sigma, R_np, or R for stage-cost evaluation.")
 
 
@@ -206,14 +211,17 @@ def closest_distance_and_events(
     cyl_safety = False
     cyl_collision = False
     for c in cylinders:
-        cx, cy, cr = float(c["cx"]), float(c["cy"]), float(c["r"])
+        cx, cy = float(c["cx"]), float(c["cy"])
+        cr = STATIC_BUILDING_RADIUS_SCALE * float(c["r"])
         zmin = float(c.get("zmin", -1e9))
         zmax = float(c.get("zmax", 1e9))
         dxy = float(np.hypot(float(p[0]) - cx, float(p[1]) - cy))
         d_cyl_min = min(d_cyl_min, dxy)
-        if zmin <= float(p[2]) <= zmax:
+        z = float(p[2])
+        if zmin - (drone_r + safety_margin) <= z <= zmax + (drone_r + safety_margin):
             if dxy < (cr + drone_r + safety_margin):
                 cyl_safety = True
+        if zmin - drone_r <= z <= zmax + drone_r:
             if dxy < (cr + drone_r):
                 cyl_collision = True
 
@@ -268,6 +276,19 @@ def _fmt_mean_std(vals: np.ndarray, digits: int = 4) -> str:
     mean = float(np.mean(vals))
     std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
     return f"{mean:.{digits}f} ± ({std:.{digits}f})"
+
+
+def _fmt_duration(seconds: float) -> str:
+    if not np.isfinite(seconds) or seconds < 0.0:
+        return "unknown"
+    seconds_i = int(round(float(seconds)))
+    h, rem = divmod(seconds_i, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:d}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m:d}m {s:02d}s"
+    return f"{s:d}s"
 
 
 def _kde_pdf(x: np.ndarray, grid: np.ndarray) -> np.ndarray:
@@ -447,6 +468,7 @@ def run_episode(
     lead_time: float,
     obs_update_steps: int,
     moving_time_offsets: np.ndarray,
+    moving_initial_advance: float,
     drone_radius: float,
     safety_margin: float,
     R_eval: np.ndarray,
@@ -481,6 +503,7 @@ def run_episode(
             lead_time=lead_time,
             last_yaw_ref=last_yaw_ref,
             moving_time_offsets=moving_time_offsets,
+            moving_initial_advance=moving_initial_advance,
         )
         if held_obs_seq is None or (k - last_obs_update_k) >= obs_update_steps:
             held_obs_seq = true_obs_seq.copy()
@@ -528,7 +551,7 @@ def main():
     dr_reference = dr_mod.DRParams(
         dt=0.03,
         horizon_steps=35,
-        rollouts=1096,
+        rollouts=1200,
         lam=2,
         ang_max=np.deg2rad(28.533048677493525),
         yaw_max=np.deg2rad(125.002671219858),
@@ -547,36 +570,28 @@ def main():
         w_cyl=510.6988597095838,
         cyl_safety_margin=0.2150292356967072,
         cyl_alpha=8.72155294537059,
-        w_moving=376.5800114691624,
         moving_r=0.3045201563139591,
-        moving_safety_margin=0.4224283788684363,
-        moving_alpha=15.033309531167399,
-        cvar_alpha=0.7790712559865822,
-        cvar_N=48,
-        obs_pos_sigma_xy=(0.1569012991377936, 0.18206816632027703),
+        moving_safety_margin=0.0,
+        cvar_alpha=0.95,
+        cvar_N=50,
+        obs_pos_sigma_xyz=(0.1, 0.1, 0.1),
         noise_mode="per_step",
-        dr_eps_cvar=0.030026822645753973,
-        drone_radius=0.3662153322325755,
-        R_u=(2, 2, 1, 2),
-        Rd_u=(2, 2, 1, 2),
+        dr_eps_cvar=0.12,
+        risk_cost_A=10.0,
+        risk_cost_Cu=0.0,
+        drone_radius=0.4,
+        R_u=(1, 1, 1, 1),
+        Rd_u=(1, 1, 1, 1),
     )
     dr_reference_lead_time = 1.5495997771078638
-    dr_reference_q = np.array([45.0, 45.0, 55.0, 0.0], dtype=float)
-    dr_reference_qf = np.array(
-        [
-            4.24444323202221 * 121.54191793531642,
-            2.2842848307817354 * 120.7320008579965,
-            3.7565634665191308 * 143.93311001418877,
-            0.0,
-        ],
-        dtype=float,
-    )
+    dr_reference_q = np.array([40.0, 40.0, 40.0, 1.0], dtype=float)
+    dr_reference_qf = np.array([40.0, 40.0, 40.0, 0.0], dtype=float)
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runs", type=int, default=20)
+    ap.add_argument("--runs", type=int, default=100)
     ap.add_argument("--outdir", type=str, default="results_crazyflie_stats_paper")
     ap.add_argument("--seed", type=int, default=12345)
-    ap.add_argument("--steps", type=int, default=550)
+    ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--alpha", type=float, default=float(dr_reference.cvar_alpha), help="CVaR alpha for RA/DR")
     ap.add_argument("--use_gpu", dest="use_gpu", action="store_true", default=True,
                     help="Use CUDA when available (default).")
@@ -586,7 +601,7 @@ def main():
     ap.add_argument(
         "--obs-update-steps",
         type=int,
-        default=20,
+        default=15,
         help="Read a fresh moving-obstacle observation every N control steps and hold it between reads.",
     )
     args = ap.parse_args()
@@ -597,13 +612,10 @@ def main():
     lead_time = float(dr_reference_lead_time)
     cvar_n = int(dr_reference.cvar_N)
     obs_noise_mode = str(dr_reference.noise_mode)
-    # DR uses XY obstacle uncertainty; the benchmark's DRA controller needs XYZ, so mirror Y onto Z.
-    obs_sigma_xyz = (
-        float(dr_reference.obs_pos_sigma_xy[0]),
-        float(dr_reference.obs_pos_sigma_xy[1]),
-        float(dr_reference.obs_pos_sigma_xy[1]),
-    )
+    obs_sigma_xyz = tuple(float(v) for v in dr_reference.obs_pos_sigma_xyz)
     extra_margin = 0.0
+    moving_soft_weight = 376.5800114691624
+    moving_soft_alpha = 15.033309531167399
 
     os.makedirs(args.outdir, exist_ok=True)
     dra_mod = _load_dra_module()
@@ -618,8 +630,37 @@ def main():
         [2.5, 2.0, 0.0],
     ], dtype=float)
 
-    moving_waypoint_sets = [waypoints.copy() for _ in range(4)]
-    moving_time_offsets = np.array([0.0, 2.5, 5.0, 7.5], dtype=float)
+    def reversed_shifted_waypoint_loop(
+        base_waypoints: np.ndarray,
+        start_shift: int,
+        z_offset: float,
+    ) -> np.ndarray:
+        loop = base_waypoints[:-1].copy()
+        reversed_loop = loop[::-1]
+        shifted = np.roll(reversed_loop, -start_shift, axis=0)
+        shifted[:, 2] = np.maximum(0.0, shifted[:, 2] + z_offset)
+        return np.vstack([shifted, shifted[0]])
+
+    moving_start_shifts = (
+        0,
+        1,
+        2,
+        4,
+        5,
+    )
+    moving_z_offsets = np.array([
+        -0.15,
+        -0.09,
+        -0.03,
+        0.09,
+        0.15,
+    ], dtype=float)
+    moving_waypoint_sets = [
+        reversed_shifted_waypoint_loop(waypoints, shift, z_offset)
+        for shift, z_offset in zip(moving_start_shifts, moving_z_offsets)
+    ]
+    moving_time_offsets = np.array([0.0, 1.5, 2.5, 5.0, 6.5], dtype=float)
+    moving_initial_advance = max(0.0, float(np.max(moving_time_offsets)) - lead_time + 1.0)
 
     cylinders = [
         {"cx": 0.5, "cy": 1.0, "r": 0.6, "zmin": 0.0, "zmax": 4.5},
@@ -684,10 +725,10 @@ def main():
         if spec["kind"] == "plain":
             p = plain_mod.MPPIParams(
                 **common_plain,
-                w_moving=float(dr_reference.w_moving),
+                w_moving=float(moving_soft_weight),
                 moving_r=float(dr_reference.moving_r),
                 moving_safety_margin=float(dr_reference.moving_safety_margin),
-                moving_alpha=float(dr_reference.moving_alpha),
+                moving_alpha=float(moving_soft_alpha),
             )
             ctrl = plain_mod.TorchMPPIQuadOuter(mass=mass, g=g, params=p, cylinders=cylinders, device=device)
             drone_radius = float(dr_reference.drone_radius)
@@ -707,15 +748,15 @@ def main():
                 w_cyl=float(dr_reference.w_cyl),
                 cyl_margin=float(dr_reference.cyl_safety_margin),
                 cyl_alpha=float(dr_reference.cyl_alpha),
-                w_moving_soft=float(dr_reference.w_moving),
                 moving_r=float(dr_reference.moving_r),
                 moving_margin=float(dr_reference.moving_safety_margin),
-                moving_alpha=float(dr_reference.moving_alpha),
                 drone_radius=float(dr_reference.drone_radius),
                 cvar_alpha=float(args.alpha),
                 cvar_N=int(cvar_n),
-                obs_pos_sigma_xy=tuple(float(v) for v in dr_reference.obs_pos_sigma_xy),
-                obs_noise_mode=str(obs_noise_mode),
+                obs_pos_sigma_xyz=obs_sigma_xyz,
+                noise_mode=str(obs_noise_mode),
+                risk_cost_A=float(dr_reference.risk_cost_A),
+                risk_cost_Cu=float(dr_reference.risk_cost_Cu),
                 R_u=tuple(float(v) for v in dr_reference.R_u),
                 Rd_u=tuple(float(v) for v in dr_reference.Rd_u),
             )
@@ -738,15 +779,15 @@ def main():
                 w_cyl=float(dr_reference.w_cyl),
                 cyl_safety_margin=float(dr_reference.cyl_safety_margin),
                 cyl_alpha=float(dr_reference.cyl_alpha),
-                w_moving=float(dr_reference.w_moving),
                 moving_r=float(dr_reference.moving_r),
                 moving_safety_margin=float(dr_reference.moving_safety_margin),
-                moving_alpha=float(dr_reference.moving_alpha),
                 cvar_alpha=float(args.alpha),
                 cvar_N=int(cvar_n),
-                obs_pos_sigma_xy=tuple(float(v) for v in dr_reference.obs_pos_sigma_xy),
+                obs_pos_sigma_xyz=obs_sigma_xyz,
                 noise_mode=str(obs_noise_mode),
                 dr_eps_cvar=float(args.dr_eps_cvar),
+                risk_cost_A=float(dr_reference.risk_cost_A),
+                risk_cost_Cu=float(dr_reference.risk_cost_Cu),
                 drone_radius=float(dr_reference.drone_radius),
                 R_u=tuple(float(v) for v in dr_reference.R_u),
                 Rd_u=tuple(float(v) for v in dr_reference.Rd_u),
@@ -769,17 +810,15 @@ def main():
                 w_cyl=float(dr_reference.w_cyl),
                 cyl_safety_margin=float(dr_reference.cyl_safety_margin),
                 cyl_alpha=float(dr_reference.cyl_alpha),
-                w_moving=float(dr_reference.w_moving),
                 moving_r=float(dr_reference.moving_r),
                 moving_safety_margin=float(dr_reference.moving_safety_margin),
-                moving_alpha=float(dr_reference.moving_alpha),
                 sigma_cp=0.05,
-                Nmc=1200,
+                Nmc=50,
                 omega_soft=10.0,
                 omega_hard=1000.0,
                 sigma=common_sigma.copy(),
                 obs_pos_sigma_xyz=tuple(float(v) for v in obs_sigma_xyz),
-                mc_chunk=256,
+                mc_chunk=1000,
                 drone_radius=float(dr_reference.drone_radius),
                 R_u=tuple(float(v) for v in dr_reference.R_u),
                 Rd_u=tuple(float(v) for v in dr_reference.Rd_u),
@@ -806,10 +845,15 @@ def main():
             run_max_compute_time_s=[],
         )
 
+    benchmark_t0 = time.perf_counter()
+    total_episodes = int(args.runs) * len(controllers)
+    completed_episodes = 0
+
     for r in range(args.runs):
         run_seed = int(run_seeds[r])
         print(f"[run {r + 1:3d}/{args.runs}] started (seed={run_seed})", flush=True)
         for spec, ctrl, drone_radius, r_eval in controllers:
+            episode_t0 = time.perf_counter()
             print(f"  [controller] {spec['name']} ...", flush=True)
             reset_controller(ctrl)
             total_qr_cost, dists, safety_violated, collided, max_compute_s = run_episode(
@@ -825,6 +869,7 @@ def main():
                 lead_time=float(lead_time),
                 obs_update_steps=int(args.obs_update_steps),
                 moving_time_offsets=moving_time_offsets,
+                moving_initial_advance=float(moving_initial_advance),
                 drone_radius=drone_radius,
                 safety_margin=float(extra_margin),
                 R_eval=r_eval,
@@ -840,9 +885,24 @@ def main():
             rec["safety_violation"].append(1.0 if safety_violated else 0.0)
             rec["collision"].append(1.0 if collided else 0.0)
             rec["run_max_compute_time_s"].append(max_compute_s)
+
+            completed_episodes += 1
+            elapsed_s = time.perf_counter() - benchmark_t0
+            episode_s = time.perf_counter() - episode_t0
+            avg_episode_s = elapsed_s / max(completed_episodes, 1)
+            remaining_episodes = max(total_episodes - completed_episodes, 0)
+            remaining_s = avg_episode_s * remaining_episodes
+            eta_wall = time.time() + remaining_s
+            eta_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(eta_wall))
             print(
                 f"  [done] {spec['name']}: cost={total_qr_cost:.4f}, "
                 f"min_dist={run_min_d:.4f}, collided={int(collided)}",
+                flush=True,
+            )
+            print(
+                f"  [eta] completed={completed_episodes}/{total_episodes}, "
+                f"last={_fmt_duration(episode_s)}, elapsed={_fmt_duration(elapsed_s)}, "
+                f"remaining~{_fmt_duration(remaining_s)}, finish~{eta_text}",
                 flush=True,
             )
 
@@ -859,6 +919,8 @@ def main():
                     RunMinDistance=rec["run_min_dist"][i],
                     SafetyViolation=rec["safety_violation"][i],
                     Collision=rec["collision"][i],
+                    TotalQRStageCost=rec["total_qr_cost"][i],
+                    # Legacy name kept for compatibility with existing plot.py scripts.
                     TotalQSigmaInvStageCost=rec["total_qr_cost"][i],
                     RunMaxComputeTimeMs=1000.0 * rec["run_max_compute_time_s"][i],
                 )
@@ -872,7 +934,7 @@ def main():
         "2) Run-min distance (mean ± std)",
         "3) Safety violation probability using (r + r_s)",
         "4) Collision probability using (r)",
-        "5) Total cost Q+Sigma^-2 only (mean ± std)",
+        "5) Total cost Q+R only (mean ± std)",
         "6) Max compute time across runs (ms)",
         "7) Run-max compute time (mean ± std) (ms)",
     ]
@@ -919,6 +981,8 @@ def main():
                 RunMinDistance_Std=float(np.std(run_min_f, ddof=1)) if len(run_min_f) > 1 else 0.0,
                 SafetyViolation_Prob=float(np.mean(safety)),
                 Collision_Prob=float(np.mean(coll)),
+                TotalQRStageCost_Mean=float(np.mean(costs)),
+                TotalQRStageCost_Std=float(np.std(costs, ddof=1)) if len(costs) > 1 else 0.0,
                 TotalQSigmaInvStageCost_Mean=float(np.mean(costs)),
                 TotalQSigmaInvStageCost_Std=float(np.std(costs, ddof=1)) if len(costs) > 1 else 0.0,
                 RunMaxComputeTimeMs_Max=float(np.max(tmax_ms)) if len(tmax_ms) > 0 else np.nan,

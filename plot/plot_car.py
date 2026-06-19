@@ -217,13 +217,13 @@ def _lane_width_from_data(data: dict) -> float:
 
 
 def _figure_size_for_scenario(scenario: int) -> tuple[float, float]:
-    if scenario in (2, 3):
+    if scenario == 2:
         return (11.0, 8.5)
     return (14.0, 5.0)
 
 
 def _apply_figure_layout(fig, scenario: int) -> None:
-    if scenario in (2, 3):
+    if scenario == 2:
         # The roundabout frames do not draw the side legend or a title, so use
         # the canvas more efficiently and trim the large left/right whitespace.
         fig.subplots_adjust(left=0.08, right=0.985, bottom=0.09, top=0.985)
@@ -234,7 +234,7 @@ def _apply_figure_layout(fig, scenario: int) -> None:
 def _fixed_axis_limits_for_scenario(
     scenario: int,
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
-    if scenario == 3:
+    if scenario == 2:
         return (0.0, 10.0), (-2.0, 5.0)
     return None
 
@@ -277,19 +277,9 @@ def _scenario_camera_view(
 
     if scenario == 2:
         lane_width = _lane_width_from_data(data)
-        _roundabout_center_x, roundabout_center_y = _roundabout_center(data, world_xmin, world_xmax, reference_span)
-
-        # Scenario 2 should read like a focused roundabout shot rather than the
-        # wide highway camera used by the original straight-road replay.
-        x_center = 0.38 * x_left + 0.62 * x_right
-        y_center = roundabout_center_y
-        x_span = max(12.0, 0.72 * float(reference_span[0]), 10.5 * lane_width)
-        y_span = max(5.4, 1.55 * float(reference_span[1]), 6.4 * lane_width)
-    elif scenario == 3:
-        lane_width = _lane_width_from_data(data)
         roundabout_center_x, roundabout_center_y = _roundabout_center(data, world_xmin, world_xmax, reference_span)
 
-        # Scenario 3 keeps the roundabout fixed on screen while cars move
+        # Scenario 2 keeps the roundabout fixed on screen while cars move
         # through the scene.
         x_center = roundabout_center_x
         y_center = roundabout_center_y
@@ -405,7 +395,7 @@ def _setup_scene(
         )
         return [lane_center_line], ["Lane center"]
 
-    if scenario in (2, 3):
+    if scenario == 2:
         ax.set_aspect("equal", adjustable="box")
         lane_width = _lane_width_from_data(data)
         center_x, center_y = _roundabout_center(data, world_xmin, world_xmax, reference_span)
@@ -748,7 +738,7 @@ def _replay_method(
         (x_min, x_max), (y_min, y_max) = fixed_limits
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
-    elif scenario == 3:
+    elif scenario == 2:
         x_center, y_center, x_span, y_span = _scenario_camera_view(
             data=data,
             scenario=scenario,
@@ -883,7 +873,7 @@ def _replay_method(
                 obs_outlines[j].set_visible(False)
                 obs_labels[j].set_visible(False)
 
-        if scenario != 3 and np.all(np.isfinite(xlim_hist[i])) and np.all(np.isfinite(ylim_hist[i])):
+        if scenario != 2 and np.all(np.isfinite(xlim_hist[i])) and np.all(np.isfinite(ylim_hist[i])):
             x_center, y_center, x_span, y_span = _scenario_camera_view(
                 data=data,
                 scenario=scenario,
@@ -1029,7 +1019,7 @@ def _replay_compare(
         (x_min, x_max), (y_min, y_max) = fixed_limits
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
-    elif scenario == 3:
+    elif scenario == 2:
         x_center, y_center, x_span, y_span = _scenario_camera_view(
             data=base_data,
             scenario=scenario,
@@ -1203,7 +1193,7 @@ def _replay_compare(
                 y_lows.append(float(ylim_hists[method][i, 0]))
                 y_highs.append(float(ylim_hists[method][i, 1]))
 
-        if scenario != 3 and x_lows and x_highs and y_lows and y_highs:
+        if scenario != 2 and x_lows and x_highs and y_lows and y_highs:
             x_center, y_center, x_span, y_span = _scenario_camera_view(
                 data=base_data,
                 scenario=scenario,
@@ -1235,9 +1225,9 @@ def main() -> None:
     parser.add_argument(
         "--scenario",
         type=int,
-        choices=[1, 2, 3],
+        choices=[1, 2],
         default=1,
-        help="Scenario 1 keeps the current straight-road view. Scenario 2 draws a moving-camera roundabout view. Scenario 3 keeps the roundabout fixed while cars move.",
+        help="Scenario 1 keeps the straight-road view. Scenario 2 keeps the roundabout fixed while cars move.",
     )
     parser.add_argument(
         "--data-dir",

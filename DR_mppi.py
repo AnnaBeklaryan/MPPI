@@ -547,7 +547,7 @@ if __name__ == "__main__":
     cvar_alpha = 0.95
     cvar_N = 10
     obs_pos_sigma = (0.07, 0.07)
-    dr_eps_cvar = 0.086
+    dr_eps_cvar = 0.1
     obs_noise_mode = "per_step"   # "static" or "per_step"
     risk_cost_A = 10.0
     risk_cost_Cu = 0.0
