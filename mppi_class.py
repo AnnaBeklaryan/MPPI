@@ -225,6 +225,7 @@ class RA_MPPI(MPPI):
         obs_noise_mode: str = "static",  # "static" or "per_step"
         risk_cost_A: float = 0.0,
         risk_cost_Cu: float = 0.0,
+        filter_infeasible_rollouts: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -245,6 +246,7 @@ class RA_MPPI(MPPI):
         self.obs_pos_sigma = obs_pos_sigma_t
         self.risk_cost_A = float(risk_cost_A)
         self.risk_cost_Cu = float(risk_cost_Cu)
+        self.filter_infeasible_rollouts = bool(filter_infeasible_rollouts)
         if self.risk_cost_A < 0.0:
             raise ValueError("risk_cost_A must be >= 0")
 
@@ -295,7 +297,9 @@ class RA_MPPI(MPPI):
         returns: (...) CVaR
         """
         alpha = self.cvar_alpha
-        N = self.cvar_N
+        N = int(L_sorted.shape[-1])
+        if N < 1:
+            raise ValueError("L_sorted must have a non-empty sample dimension")
         k = int(np.ceil(alpha * N))
         k_idx = k - 1
         tail_sum = torch.sum(L_sorted[..., k_idx:], dim=-1)
@@ -474,7 +478,9 @@ class RA_MPPI(MPPI):
             risk_penalty[risk_mask] = self.risk_cost_A * cvar_max[risk_mask]
         J_total = J + risk_penalty
 
-        if not bool(torch.any(feasible).item()):
+        if not self.filter_infeasible_rollouts:
+            feasible = torch.ones_like(feasible)
+        elif not bool(torch.any(feasible).item()):
             best = int(torch.argmin(J_total).item())
             feasible = torch.zeros_like(feasible)
             feasible[best] = True
@@ -584,7 +590,6 @@ class DR_MPPI(RA_MPPI):
 
         O_mean = O_mean.to(device=self.device, dtype=self.dtype)
         K = int(O_mean.shape[1])
-        N = int(self.cvar_N)
 
         use_rectangles = (
             (X_hist_phi is not None)
@@ -596,9 +601,10 @@ class DR_MPPI(RA_MPPI):
         )
 
         O_samp = self._sample_obstacles(O_mean, obs_noise_std=obs_noise_std)  # (T,K,N,D)
+        N = int(O_samp.shape[2])
         if use_rectangles:
             O_phi = O_phi.to(device=self.device, dtype=self.dtype)
-            L_worst = None
+            L_steps = []
             for t in range(T):
                 sep_t = rectangle_signed_distance_torch(
                     ego_xy=X_hist_xy[t][:, None, None, :2],
@@ -611,7 +617,8 @@ class DR_MPPI(RA_MPPI):
                     obs_half_width=obs_half_width,
                 )
                 g_t = float(obstacle_buffer) - sep_t
-                L_worst = g_t if L_worst is None else torch.maximum(L_worst, g_t)
+                L_steps.append(g_t)
+            L = torch.stack(L_steps, dim=0)                                 # (T,M,K,N)
         else:
             if radii is None:
                 feasible = torch.ones((M,), device=self.device, dtype=torch.bool)
@@ -633,12 +640,13 @@ class DR_MPPI(RA_MPPI):
             Rk = radii.reshape(1, 1, K, 1)
             g = Rk - dist                                                  # (T,M,K,N)
 
-            # L_worst = max_t g
-            L_worst = torch.amax(g, dim=0)                                 # (M,K,N)
+            L = g
 
-        # sort over samples
-        Ls, _ = torch.sort(L_worst, dim=-1)                            # (M,K,N)
-        cvar_per_obs = self._cvar_from_sorted(Ls)                      # (M,K)
+        # DR risk samples are all horizon-step / obstacle-noise losses.
+        # No max over horizon is taken here.
+        L = L.permute(1, 2, 0, 3).reshape(M, K, T * N)                  # (M,K,T*N)
+        Ls, _ = torch.sort(L, dim=-1)                                   # (M,K,T*N)
+        cvar_per_obs = self._cvar_from_sorted(Ls)                       # (M,K)
 
         # DR correction (exactly your CuPy)
         if self.dr_eps_cvar > 0.0:

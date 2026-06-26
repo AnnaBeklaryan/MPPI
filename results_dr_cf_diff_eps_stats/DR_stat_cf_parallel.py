@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Parallel epsilon sweep for DR_mppi_crazyflie.py.
+Parallel epsilon sweep for DR_mppi_crazyflie copy.py.
 
 Example:
-python3 results_dr_cf_diff_eps_stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.00 --eps-max 0.2 --eps-step 0.005 --workers 3 --obs-update-steps 10 --steps 400 --use_gpu
+python3 results_dr_cf_diff_eps_stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.00 --eps-max 0.2 --eps-step 0.005 --workers 3 --obs-update-steps 15 --steps 700 --use_gpu
 
-This runner imports DR_mppi_crazyflie.py and calls its simulate(...) function
-directly, so controller/scenario parameter edits live in DR_mppi_crazyflie.py.
+This runner imports the configured DR Crazyflie file and calls its simulate(...)
+function directly, so controller/scenario parameter edits live in that file.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import contextlib
+import importlib.util
 import io
 import multiprocessing as mp
 import os
@@ -33,11 +34,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import DR_mppi_crazyflie as cf_dr
-
-
 DEFAULT_EPSILONS = np.arange(0.0, 0.1001, 0.005, dtype=np.float64)
 DEFAULT_OUTDIR = Path(__file__).resolve().parent
+DEFAULT_SCENARIO_FILE = ROOT_DIR / "DR_mppi_crazyflie copy.py"
+cf_dr = None
 RUN_COLUMNS = [
     "epsilon",
     "Run",
@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--use_gpu", action="store_true")
     ap.add_argument(
+        "--scenario-file",
+        type=str,
+        default=str(DEFAULT_SCENARIO_FILE),
+        help="DR Crazyflie simulator file to import. Defaults to 'DR_mppi_crazyflie copy.py'.",
+    )
+    ap.add_argument(
         "--append",
         type=_str_to_bool,
         nargs="?",
@@ -110,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--steps",
         type=int,
-        default=400,
+        default=700,
         help="Number of simulation control steps to run for each epsilon/run pair.",
     )
     ap.add_argument(
@@ -134,6 +140,26 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--quiet-sim", action="store_true", default=True, help="Suppress per-step simulation logs.")
     ap.add_argument("--no-quiet-sim", dest="quiet_sim", action="store_false", help="Show per-step simulation logs.")
     return ap.parse_args()
+
+
+def _load_scenario_module(path_like: str | Path):
+    scenario_path = Path(path_like)
+    if not scenario_path.is_absolute():
+        scenario_path = ROOT_DIR / scenario_path
+    scenario_path = scenario_path.resolve()
+    if not scenario_path.exists():
+        raise FileNotFoundError(f"Scenario file does not exist: {scenario_path}")
+
+    module_name = f"_dr_cf_scenario_{abs(hash(str(scenario_path))) & 0xffffffff:x}"
+    spec = importlib.util.spec_from_file_location(module_name, scenario_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import scenario file: {scenario_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    if not hasattr(module, "simulate"):
+        raise AttributeError(f"Scenario file {scenario_path} has no simulate(...) function")
+    return module
 
 
 def build_epsilon_sweep(args: argparse.Namespace) -> np.ndarray:
@@ -266,6 +292,10 @@ def _summarize_moving_obstacle_collisions(
 
 
 def _run_one_simulation(eps: float, run_seed: int, args_dict: dict[str, Any]) -> dict[str, Any]:
+    global cf_dr
+    if cf_dr is None:
+        cf_dr = _load_scenario_module(args_dict["scenario_file"])
+
     np.random.seed(int(run_seed) % (2**32 - 1))
     torch.manual_seed(int(run_seed))
     if torch.cuda.is_available():
@@ -426,6 +456,8 @@ def _append_result_to_csv(
 
 def main() -> None:
     args = parse_args()
+    global cf_dr
+    cf_dr = _load_scenario_module(args.scenario_file)
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     run_csv = outdir / "dr_cf_epsilon_run_metrics.csv"
@@ -460,10 +492,11 @@ def main() -> None:
         log_runs_every=max(0, int(args.log_runs_every)),
         quiet_sim=bool(args.quiet_sim),
         torch_threads=int(torch_threads),
+        scenario_file=str(Path(args.scenario_file).resolve() if Path(args.scenario_file).is_absolute() else (ROOT_DIR / args.scenario_file).resolve()),
     )
 
     print(f"[scenario] using {Path(cf_dr.__file__).resolve()}", flush=True)
-    print("[scenario] controller parameters are read from DR_mppi_crazyflie.simulate(...)", flush=True)
+    print("[scenario] controller parameters are read from the selected scenario simulate(...)", flush=True)
     print(f"[epsilon sweep] values={eps_sweep.tolist()}", flush=True)
     print(
         f"[parallel] workers={workers} start_method=spawn "

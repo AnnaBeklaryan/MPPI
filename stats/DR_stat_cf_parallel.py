@@ -3,9 +3,9 @@
 Parallel epsilon sweep for DR_mppi_crazyflie.py.
 
 Example:
-python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.5 --eps-step 0.005 --workers 15 --obs-update-steps 15 --steps 400 --use_gpu
-python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.505 --eps-max 1.0 --eps-step 0.005 --workers 15 --obs-update-steps 15 --steps 400 --append
-python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.505 --eps-max 1 --eps-step 0.005 --workers 15 --obs-update-steps 15 --steps 400 --append true
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 8 --obs-update-steps 15 --steps 400
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 1 --obs-update-steps 15 --steps 400 --use_gpu
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 8 --obs-update-steps 15 --steps 400 --append true
 """
 
 from __future__ import annotations
@@ -91,8 +91,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional explicit list of dr_eps_cvar values.",
     )
     ap.add_argument("--eps-min", type=float, default=0.00, help="Minimum epsilon for a sweep.")
-    ap.add_argument("--eps-max", type=float, default=0.00, help="Maximum epsilon for a sweep.")
-    ap.add_argument("--eps-step", type=float, default=0.2, help="Epsilon step when --eps-max is used.")
+    ap.add_argument("--eps-max", type=float, default=None, help="Maximum epsilon for a sweep. Omit to use the default 0.0..0.1 sweep.")
+    ap.add_argument("--eps-step", type=float, default=0.005, help="Epsilon step when --eps-max is used.")
     ap.add_argument(
         "--obs-update-steps",
         type=int,

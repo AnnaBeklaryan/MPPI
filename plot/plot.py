@@ -32,6 +32,9 @@ METHODS = {
     "dramppi": ("DRA_mppi_crazyflie", "dramppi_simulation.npz"),
 }
 
+CRAZYFLIE_ARM_LEN = 0.044
+LABEL_Z_OFFSET = 0.08
+
 
 def _saved_path(method: str) -> Path:
     return PLOT_DIR / METHODS[method][1]
@@ -339,7 +342,7 @@ def _build_plotly_figure(method: str, data: dict[str, np.ndarray], with_predicti
             go.Scatter3d(
                 x=[po[0]],
                 y=[po[1]],
-                z=[po[2] + 0.35],
+                z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
                 mode="text",
                 text=[f"obs {j}"],
                 textfont=dict(color="#111111", size=14),
@@ -441,12 +444,12 @@ def _build_plotly_figure(method: str, data: dict[str, np.ndarray], with_predicti
     dynamic_trace_idx.append(current_collision_idx)
 
     frames: list[go.Frame] = []
-    obs_arm_len = 0.3
+    obs_arm_len = CRAZYFLIE_ARM_LEN
     obs_d1 = np.array([1.0, 1.0, 0.0], dtype=float)
     obs_d2 = np.array([1.0, -1.0, 0.0], dtype=float)
     obs_d1 /= (np.linalg.norm(obs_d1) + 1e-12)
     obs_d2 /= (np.linalg.norm(obs_d2) + 1e-12)
-    arm_len = 0.35
+    arm_len = CRAZYFLIE_ARM_LEN
     x_hist = np.asarray(data["X_hist"], dtype=float) if "X_hist" in data else None
     for i in range(steps):
         frame_data: list[go.Scatter3d] = []
@@ -470,7 +473,7 @@ def _build_plotly_figure(method: str, data: dict[str, np.ndarray], with_predicti
                 go.Scatter3d(
                     x=[po[0]],
                     y=[po[1]],
-                    z=[po[2] + 0.35],
+                    z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
                     text=[f"obs {j}"],
                 )
             )
@@ -664,7 +667,7 @@ def _build_compare_figure(all_data: dict[str, dict[str, np.ndarray]]) -> go.Figu
             go.Scatter3d(
                 x=[po[0]],
                 y=[po[1]],
-                z=[po[2] + 0.35],
+                z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
                 mode="text",
                 text=[f"obs {j}"],
                 textfont=dict(color="#111111", size=14),
@@ -727,7 +730,7 @@ def _build_compare_figure(all_data: dict[str, dict[str, np.ndarray]]) -> go.Figu
         )
         dynamic_trace_idx.append(len(fig.data) - 1)
 
-    obs_arm_len = 0.3
+    obs_arm_len = CRAZYFLIE_ARM_LEN
     obs_d1 = np.array([1.0, 1.0, 0.0], dtype=float)
     obs_d2 = np.array([1.0, -1.0, 0.0], dtype=float)
     obs_d1 /= (np.linalg.norm(obs_d1) + 1e-12)
@@ -753,7 +756,7 @@ def _build_compare_figure(all_data: dict[str, dict[str, np.ndarray]]) -> go.Figu
                 go.Scatter3d(
                     x=[po[0]],
                     y=[po[1]],
-                    z=[po[2] + 0.35],
+                    z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
                     text=[f"obs {j}"],
                 )
             )
