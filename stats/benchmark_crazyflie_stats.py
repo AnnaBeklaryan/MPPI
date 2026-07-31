@@ -13,7 +13,7 @@ benchmark stays aligned with the live scenario/controller code:
 Example:
 python3 stats/benchmark_crazyflie_stats.py --runs 100 --steps 520 \
   --obs-update-steps 15 --outdir stats/results_crazyflie_stats_paper \
-  --use_gpu  --dr-eps-cvar 0.0015
+  --use_gpu  --dr-eps-cvar 0.002
 """
 
 from __future__ import annotations
