@@ -15,7 +15,7 @@ This version:
 - Saves buffers to .npz for offline plotting/replay
 - Prints solve time during simulation
 
-python3 mppi_crazyflie.py  --obs-update-steps 15 --steps 400 --save
+python3 mppi_crazyflie.py  --obs-update-steps 15 --steps 520 --save
 
 """
 
@@ -30,6 +30,7 @@ import numpy as np
 
 import torch
 from mppi_class import MPPI  # your Torch MPPI
+from physical_figure8 import evaluate as evaluate_physical_figure8
 
 
 # -----------------------------
@@ -53,10 +54,21 @@ class SimpleCrazyflieReference:
     trajectory_speed: float = 0.6
     speed_ramp: float = 0.1
     reverse_direction: bool = False
+    speed_schedule: tuple[tuple[float, float], ...] | None = None
 
     def __post_init__(self):
         self.start_position = np.asarray(self.start_position, dtype=float).reshape(3)
-        if self.trajectory_type == "tilted_figure8":
+        self.speed_schedule_np = None
+        if self.speed_schedule is not None:
+            schedule = np.asarray(self.speed_schedule, dtype=float)
+            if schedule.ndim != 2 or schedule.shape[1] != 2 or schedule.shape[0] < 1:
+                raise ValueError("speed_schedule must be ((time_s, speed), ...)")
+            order = np.argsort(schedule[:, 0])
+            schedule = schedule[order]
+            schedule[:, 0] = np.maximum(schedule[:, 0], 0.0)
+            schedule[0, 0] = 0.0
+            self.speed_schedule_np = schedule
+        if self.trajectory_type == "tilted_figure8" and self.speed_schedule_np is None:
             self.cycle_time = (2.0 * math.pi) / max(1e-6, float(self.trajectory_speed))
         self.total_time = float(self.hover_begin + self.cycle_time)
 
@@ -92,6 +104,25 @@ class SimpleCrazyflieReference:
             return fallback
         return math.atan2(vy, vx)
 
+    def _phase_and_speed(self, t: float):
+        if self.speed_schedule_np is None:
+            return float(self.trajectory_speed) * t, float(self.trajectory_speed)
+
+        schedule = self.speed_schedule_np
+        phase = 0.0
+        last_t = 0.0
+        speed = float(schedule[0, 1])
+        for next_t, next_speed in schedule[1:]:
+            next_t = float(next_t)
+            if t <= next_t:
+                phase += speed * max(0.0, t - last_t)
+                return phase, speed
+            phase += speed * max(0.0, next_t - last_t)
+            last_t = next_t
+            speed = float(next_speed)
+        phase += speed * max(0.0, t - last_t)
+        return phase, speed
+
     def _pos_vel(self, t: float):
         if t < self.hover_begin:
             return self.start_position.copy(), np.zeros(3, dtype=float)
@@ -100,26 +131,10 @@ class SimpleCrazyflieReference:
         direction = -1.0 if self.reverse_direction else 1.0
 
         if self.trajectory_type == "tilted_figure8":
-            amp_x = 0.5
-            amp_y = 0.2
-            amp_z = 0.0
-            omega = float(self.trajectory_speed)
-            s = direction * omega * t
-            p = self.start_position + np.array(
-                [
-                    amp_x * math.sin(s),
-                    amp_y * math.sin(2.0 * s),
-                    amp_z * math.sin(s),
-                ],
-                dtype=float,
-            )
-            v = direction * np.array(
-                [
-                    amp_x * omega * math.cos(s),
-                    2.0 * amp_y * omega * math.cos(2.0 * s),
-                    amp_z * omega * math.cos(s),
-                ],
-                dtype=float,
+            phase, omega = self._phase_and_speed(t)
+            s = direction * phase
+            p, v = evaluate_physical_figure8(
+                s, direction * omega, self.start_position, x_peak=0.5, y_peak=0.2
             )
         elif self.trajectory_type == "tilted_square":
             side_length = 1.0
@@ -408,6 +423,34 @@ def terminal_cost_quad(
     return J
 
 
+def _state_error_cost_np(x, ref, Q):
+    e = np.asarray(x, dtype=float) - np.asarray(ref, dtype=float)
+    e[6:9] = np.array([wrap_pi(float(v)) for v in e[6:9]], dtype=float)
+    return float(np.sum((e * e) * np.asarray(Q, dtype=float)))
+
+
+def _executed_tracking_stage_cost_np(x, u, ref, Q, R, u_nom, Rd):
+    u = np.asarray(u, dtype=float).reshape(4)
+    total = _state_error_cost_np(x, ref, Q)
+    total += float(np.sum((u * u) * np.asarray(R, dtype=float).reshape(4)))
+    if u_nom is not None and Rd is not None:
+        du = u - np.asarray(u_nom, dtype=float).reshape(4)
+        total += float(np.sum((du * du) * np.asarray(Rd, dtype=float).reshape(4)))
+    return float(total)
+
+
+def _executed_full_stage_cost_np(x, u, ref, Q, R, u_nom, Rd, params, obs_now):
+    total = _executed_tracking_stage_cost_np(x, u, ref, Q, R, u_nom, Rd)
+    if obs_now is not None:
+        obs_points = np.asarray(obs_now, dtype=float).reshape(-1, 3)
+        if obs_points.size:
+            dists = np.linalg.norm(obs_points - np.asarray(x, dtype=float)[None, 0:3], axis=1)
+            radius = float(params.moving_r) + float(params.moving_safety_margin) + float(params.drone_radius)
+            signed = dists - radius
+            total += float(params.w_moving) * float(np.sum(np.exp(-float(params.moving_alpha) * signed)))
+    return float(total)
+
+
 # -----------------------------
 # MPPI wrapper (Torch)
 # -----------------------------
@@ -587,6 +630,10 @@ def simulate(
     trajectory_center = np.array([0.0, -0.8, 2.4], dtype=float)
     ego_ref_speed = 0.6
     obstacle_ref_speed = 0.5
+    moving_speed_schedules = [
+        ((0.0, 0.50), (0.50, 2.70), (0.62, 0.50), (1.10, 2.50), (1.22, 0.50), (1.70, 2.80), (1.82, 0.50), (2.35, 2.60), (2.47, 0.50), (3.05, 2.70), (3.18, 0.50), (3.75, 2.50), (3.88, 0.50), (4.45, 2.80), (4.57, 0.50), (5.15, 2.60), (5.28, 0.50), (5.90, 2.70), (6.02, 0.50), (6.60, 2.50), (6.72, 0.50), (7.30, 2.80), (7.43, 0.50), (8.05, 2.60), (8.18, 0.50), (8.80, 2.70), (8.92, 0.50), (9.50, 2.50), (9.62, 0.50), (10.20, 2.80), (10.32, 0.50), (10.82, 2.60), (10.94, 0.50), (11.42, 2.70), (11.54, 0.50), (12.12, 2.50), (12.24, 0.50), (12.82, 2.80), (12.94, 0.50), (13.52, 2.60), (13.64, 0.50), (14.22, 2.70), (14.34, 0.50), (14.92, 2.50), (15.04, 0.50)),
+        ((0.0, 0.50), (0.35, 2.60), (0.48, 0.50), (0.95, 2.80), (1.07, 0.50), (1.55, 2.50), (1.68, 0.50), (2.15, 2.70), (2.27, 0.50), (2.85, 2.60), (2.98, 0.50), (3.50, 2.80), (3.62, 0.50), (4.20, 2.50), (4.33, 0.50), (4.90, 2.70), (5.03, 0.50), (6.07, 2.60), (6.60, 0.50), (6.77, 2.80), (6.90, 0.50), (7.47, 2.50), (7.59, 0.50), (8.22, 2.70), (8.35, 0.50), (8.92, 2.60), (9.04, 0.50), (9.62, 2.80), (9.75, 0.50), (10.32, 2.50), (10.44, 0.50), (11.07, 2.70), (11.20, 0.50), (11.77, 2.60), (11.89, 0.50), (12.47, 2.80), (12.60, 0.50), (13.17, 2.50), (13.29, 0.50), (13.92, 2.70), (14.05, 0.50), (14.62, 2.60), (14.74, 0.50), (14.87, 2.80), (14.99, 0.50)),
+    ]
     traj = SimpleCrazyflieReference(
         start_position=trajectory_center,
         dt=0.02,
@@ -603,6 +650,7 @@ def simulate(
             hover_begin=0.0,
             trajectory_speed=obstacle_ref_speed,
             reverse_direction=True,
+            speed_schedule=moving_speed_schedules[0],
         ),
         SimpleCrazyflieReference(
             start_position=trajectory_center,
@@ -611,11 +659,12 @@ def simulate(
             hover_begin=0.0,
             trajectory_speed=obstacle_ref_speed,
             reverse_direction=True,
+            speed_schedule=moving_speed_schedules[1],
         ),
     ]
     n_moving_obstacles = len(moving_trajs)
     moving_time_offsets = np.array(
-        [0.0, moving_trajs[1].total_time * 0.25],
+        [0.0, moving_trajs[1].total_time * 0.09],
         dtype=float,
     )
 
@@ -638,8 +687,8 @@ def simulate(
         w_moving=50.0,
         moving_r=0.04,
         moving_safety_margin=0.0,
-        moving_alpha=12.0,
-        obs_pos_sigma_xyz=(0.1, 0.1, 0.1),
+        moving_alpha=5.0,
+        obs_pos_sigma_xyz=(0.01, 0.01, 0.01),
         R_u=(5.7, 8.7, 3.1, 0.01),
         Rd_u=(5.7, 8.7, 3.1, 0.01),
     )
@@ -694,7 +743,7 @@ def simulate(
         return ref[0:3], ref[3:6]
 
     lead_time = 1.5495997771078638
-    moving_initial_advance = 0.0
+    moving_initial_advance = max(0.0, float(np.max(moving_time_offsets)) - lead_time + 5.3)
 
     # precompute curves for drawing
     tt = np.linspace(0.0, traj.total_time, 600)
@@ -719,6 +768,10 @@ def simulate(
     pred_nominal_xyz = np.full((steps, ctrl.T + 1, 3), np.nan, dtype=np.float32)
     U_applied = np.zeros((steps, 4), dtype=float)
     solve_ms = np.zeros((steps,), dtype=float)
+    full_stage_cost = np.zeros((steps,), dtype=float)
+    tracking_stage_cost = np.zeros((steps,), dtype=float)
+    terminal_full_cost = 0.0
+    terminal_tracking_cost = 0.0
     min_obstacle_dist = np.full((steps,), np.nan, dtype=float)
     safety_flags = np.zeros((steps,), dtype=np.int8)
     collision_flags = np.zeros((steps,), dtype=np.int8)
@@ -781,6 +834,7 @@ def simulate(
         if ctrl.device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
+        u_nom0 = np.asarray(ctrl.mppi.U_cpu[0], dtype=float).copy()
         # LAG HOTSPOT:
         # Enabling prediction collection triggers sample extraction + GPU->CPU transfer.
         # Lower frequency (increase pred_stride) to reduce solve-time overhead.
@@ -849,6 +903,26 @@ def simulate(
 
         X_path[i] = x[0:3]
         X_hist[i] = x.copy()
+        tracking_stage_cost[i] = _executed_tracking_stage_cost_np(
+            x=x,
+            u=U_applied[i],
+            ref=ref_seq[1],
+            Q=Q,
+            R=ctrl.R_np,
+            u_nom=u_nom0,
+            Rd=ctrl.Rd_np,
+        )
+        full_stage_cost[i] = _executed_full_stage_cost_np(
+            x=x,
+            u=U_applied[i],
+            ref=ref_seq[1],
+            Q=Q,
+            R=ctrl.R_np,
+            u_nom=u_nom0,
+            Rd=ctrl.Rd_np,
+            params=params,
+            obs_now=obs_seq[1],
+        )
         dmin, hit_safety, hit_collision = collision_log_for_position(x[0:3], true_obs_seq[0])
         min_obstacle_dist[i] = dmin
         safety_flags[i] = int(hit_safety)
@@ -865,6 +939,10 @@ def simulate(
                 f"dmin={dmin:.3f} safety={int(hit_safety)} collision={int(hit_collision)}"
             )
 
+    terminal_full_cost = _state_error_cost_np(x, ref_seq[1], Qf)
+    terminal_tracking_cost = _state_error_cost_np(x, ref_seq[1], Qf)
+    total_full_cost = float(np.sum(full_stage_cost) + terminal_full_cost)
+    total_tracking_cost = float(np.sum(tracking_stage_cost) + terminal_tracking_cost)
     print(
         f"[MPPI summary] min_dist={np.nanmin(min_obstacle_dist):.3f} "
         f"safety={int(ever_safety)} collision={int(ever_collision)} "
@@ -884,6 +962,12 @@ def simulate(
         "obs_path": obs_path,
         "U_applied": U_applied,
         "solve_ms": solve_ms,
+        "full_stage_cost": full_stage_cost,
+        "tracking_stage_cost": tracking_stage_cost,
+        "terminal_full_cost": np.array(terminal_full_cost, dtype=float),
+        "total_full_cost": np.array(total_full_cost, dtype=float),
+        "terminal_tracking_cost": np.array(terminal_tracking_cost, dtype=float),
+        "total_tracking_cost": np.array(total_tracking_cost, dtype=float),
         "min_obstacle_dist": min_obstacle_dist,
         "safety_flags": safety_flags,
         "collision_flags": collision_flags,
@@ -896,6 +980,7 @@ def simulate(
         "obs_update_steps": np.array(obs_update_steps, dtype=np.int32),
         "ref_curve": ref_curve,
         "obs_curves": np.asarray(obs_curves, dtype=float),
+        "moving_speed_schedules": np.asarray(moving_speed_schedules, dtype=float),
         "mins": mins,
         "maxs": maxs,
         "pred_samples_xyz": pred_samples_xyz,

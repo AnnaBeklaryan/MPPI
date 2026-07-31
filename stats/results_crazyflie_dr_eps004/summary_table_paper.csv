@@ -1,0 +1,10 @@
+Metric,MPPI,RAMPPI,DRMPPI,DRAMPPI
+1) Min distance across runs (min of run minima),0.0035,0.0582,0.0775,0.0685
+2) Run-min distance (mean +/- std),0.0130 +/- (0.0054),0.0791 +/- (0.0064),0.0944 +/- (0.0043),0.0831 +/- (0.0055)
+3) Safety violation probability using simulator flags,1.0000,0.4700,0.0100,0.2800
+4) Collision probability using simulator flags,1.0000,0.4700,0.0100,0.2800
+5) Total full controller cost (mean +/- std),5370.0925 +/- (897.9558),1626.5330 +/- (458.6932),17788.9099 +/- (2154.6744),13723.6717 +/- (12708.3481)
+6) Max compute time across runs (ms),204.6566,130.4569,109.4744,129.2088
+7) Run-max compute time (mean +/- std) (ms),54.5799 +/- (23.0996),59.6446 +/- (20.1584),58.0803 +/- (16.2306),59.0130 +/- (16.3935)
+8) Mean compute time per step (mean +/- std) (ms),43.2168 +/- (12.3601),46.3696 +/- (11.9364),46.2217 +/- (10.3364),46.5016 +/- (9.4895)
+9) Wall time per episode (mean +/- std) (s),30.5061 +/- (8.6547),32.8396 +/- (8.3584),32.7358 +/- (7.2362),32.9329 +/- (6.6426)

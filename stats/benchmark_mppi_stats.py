@@ -13,7 +13,7 @@ Row metrics:
 2) Mean ± std of per-run minimum distance
 3) Safety violation probability using threshold (r + r_s)
 4) Collision probability using threshold (r)
-5) Mean ± std of total trajectory stage cost (Q and R only; no terminal cost)
+5) Mean ± std of total tracking/control cost over collision-free runs
 6) Global maximum of per-run maximum compute time
 7) Mean ± std of per-run maximum compute time
 
@@ -66,6 +66,12 @@ def eval_stage_cost(x, u, ref, Q, R):
     e = x - ref
     e[2] = plain_mod.angle_wrap(float(e[2]))
     return float(np.dot(e * e, Q) + np.dot(u * u, R))
+
+
+def eval_terminal_cost(x, ref, Qf):
+    e = x - ref
+    e[2] = plain_mod.angle_wrap(float(e[2]))
+    return float(np.dot(e * e, Qf))
 
 
 def min_dist_to_obstacles(
@@ -365,6 +371,7 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
     obs_update_dt = params["obs_update_dt"]
 
     total_qr_cost = 0.0
+    last_ref = None
     min_dists = []
     safety_violated = False
     collided = False
@@ -383,6 +390,7 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
     Qf_t = torch.as_tensor(params["Qf"], device=ctrl.device, dtype=ctrl.dtype)
     y_min_t = torch.as_tensor(params["y_min_bound"], device=ctrl.device, dtype=ctrl.dtype)
     y_max_t = torch.as_tensor(params["y_max_bound"], device=ctrl.device, dtype=ctrl.dtype)
+    plain_obs_rng = np.random.default_rng(int(run_seed) + 7919) if kind == "plain" else None
     path_xy_t = None
     if scenario == 2 and params["ref_path_xypsi"] is not None:
         path_xy_t = torch.as_tensor(
@@ -433,6 +441,17 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
         else:
             radii_for_mppi = np.array([], dtype=np.float32)
 
+        O_mean_for_ctrl = O_mean
+        if kind == "plain" and K > 0:
+            obs_pos_sigma = np.asarray(params["plain_obs_pos_sigma"], dtype=np.float32).reshape(1, 1, 2)
+            if np.any(obs_pos_sigma != 0.0):
+                obs_noise = plain_obs_rng.normal(
+                    loc=0.0,
+                    scale=obs_pos_sigma,
+                    size=O_mean.shape,
+                ).astype(np.float32)
+                O_mean_for_ctrl = (O_mean.astype(np.float32) + obs_noise).astype(np.float32)
+
         if scenario == 1:
             ref = np.array([float(x[0]) + params["L_ref"], params["lane_y"], params["lane_psi"]], dtype=np.float32)
         else:
@@ -444,6 +463,7 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
                 last_nearest_idx=ref_nearest_idx,
             )
             ref = np.asarray(ref, dtype=np.float32)
+        last_ref = ref.copy()
 
         ctrl.cost_kwargs["ref"] = torch.as_tensor(ref, device=ctrl.device, dtype=ctrl.dtype)
         ctrl.cost_kwargs["Q"] = Q_t
@@ -464,9 +484,14 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
             ctrl.cost_kwargs["path_boundary_w"] = 0.0
             ctrl.cost_kwargs["path_boundary_k"] = params["path_boundary_k"]
             ctrl.cost_kwargs["path_corridor_radius"] = params["path_corridor_radius"]
-        ctrl.cost_kwargs["obs_w"] = params["plain_obs_w"] if kind == "plain" else 0.0
+        if kind == "plain":
+            ctrl.cost_kwargs["obs_w"] = params["plain_obs_w"]
+            ctrl.cost_kwargs["terminal_obs_w"] = params["plain_terminal_obs_w"]
+        else:
+            ctrl.cost_kwargs.pop("obs_w", None)
+            ctrl.cost_kwargs.pop("terminal_obs_w", None)
         if K > 0:
-            ctrl.cost_kwargs["O_mean"] = torch.as_tensor(O_mean, device=ctrl.device, dtype=ctrl.dtype)
+            ctrl.cost_kwargs["O_mean"] = torch.as_tensor(O_mean_for_ctrl, device=ctrl.device, dtype=ctrl.dtype)
             ctrl.cost_kwargs["O_phi"] = torch.as_tensor(O_phi, device=ctrl.device, dtype=ctrl.dtype)
             ctrl.cost_kwargs["radii"] = torch.as_tensor(radii_for_mppi, device=ctrl.device, dtype=ctrl.dtype)
             ctrl.cost_kwargs["ego_half_length"] = float(params["ego_half_length"])
@@ -513,7 +538,7 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
         u0 = U[0].astype(np.float32).copy()
         u0[0] = np.clip(params["u_blend_v"] * u0[0] + (1.0 - params["u_blend_v"]) * params["v_des"], 0.0, float(params["u_max"][0]))
 
-        # Q + R stage cost only (terminal excluded by design).
+        # Q + R stage cost only; terminal Qf is added after the episode.
         total_qr_cost += eval_stage_cost(x, u0, ref, params["Q"], params["R"])
 
         if kind == "plain":
@@ -573,6 +598,27 @@ def run_episode(ctrl, kind, obs_csv, sim_time_grid, params, run_seed):
             collided = True
             safety_violated = True
             break
+
+    if scenario == 1:
+        terminal_ref = np.array(
+            [float(x[0]) + params["L_ref"], params["lane_y"], params["lane_psi"]],
+            dtype=np.float32,
+        )
+    elif params["ref_path_xypsi"] is not None:
+        terminal_ref, _terminal_nearest_idx, _terminal_target_idx = plain_mod.reference_from_path(
+            x_now=x,
+            path_xypsi=params["ref_path_xypsi"],
+            path_s=params["ref_path_s"],
+            lookahead_dist=params["L_ref"],
+            last_nearest_idx=ref_nearest_idx,
+        )
+        terminal_ref = np.asarray(terminal_ref, dtype=np.float32)
+    elif last_ref is not None:
+        terminal_ref = np.asarray(last_ref, dtype=np.float32)
+    else:
+        terminal_ref = np.asarray(x, dtype=np.float32)
+
+    total_qr_cost += eval_terminal_cost(x, terminal_ref, params["Qf"])
 
     max_compute_time = float(np.max(step_compute_times)) if len(step_compute_times) > 0 else np.nan
     return float(total_qr_cost), np.asarray(min_dists, dtype=np.float32), bool(safety_violated), bool(collided), max_compute_time
@@ -674,15 +720,17 @@ def main():
     R = np.array([0.004, 0.004], dtype=np.float32)
     cvar_N = 10
     ra_dr_obs_pos_sigma = (0.07, 0.07)
-    dr_eps_cvar = 0.12
+    dr_eps_cvar = 0.084
     obs_noise_mode = "per_step"
-    risk_cost_A = 10.0
+    risk_cost_A = 100.0
     risk_cost_Cu = 0.0
-    plain_obs_w = 5e3
-    dra_sigma_cp = 0.05
+    plain_obs_w = 100
+    plain_terminal_obs_w = plain_obs_w
+    plain_obs_pos_sigma = np.array([0.07, 0.07], dtype=np.float32)
+    dra_sigma_cp = 0.0
     dra_Nmc = 10
-    dra_omega_soft = 10.0
-    dra_omega_hard = 1000.0
+    dra_omega_soft = 100.0
+    dra_omega_hard = 10.0
     dra_obs_pos_sigma = (0.07, 0.07)
     dra_mc_chunk = 1000
 
@@ -757,6 +805,8 @@ def main():
         R=R,
         Qf=Qf,
         plain_obs_w=plain_obs_w,
+        plain_terminal_obs_w=plain_terminal_obs_w,
+        plain_obs_pos_sigma=plain_obs_pos_sigma,
         ego_length=ego_length,
         ego_width=ego_width,
         obs_length=obs_length,
@@ -840,7 +890,6 @@ def main():
             O_mean=None,
             O_phi=None,
             radii=None,
-            obs_w=0.0,
             ego_half_length=None,
             ego_half_width=None,
             obs_half_length=None,
@@ -858,6 +907,12 @@ def main():
         ),
     )
 
+    def fresh_common_kwargs() -> dict:
+        kwargs = dict(common_kwargs)
+        kwargs["dyn_kwargs"] = dict(common_kwargs["dyn_kwargs"])
+        kwargs["cost_kwargs"] = dict(common_kwargs["cost_kwargs"])
+        return kwargs
+
     alg_specs = [
         {"name": "MPPI", "kind": "plain"},
         {"name": "RAMPPI", "kind": "ra"},
@@ -868,11 +923,14 @@ def main():
     controllers = []
     for spec in alg_specs:
         if spec["kind"] == "plain":
+            plain_kwargs = fresh_common_kwargs()
+            plain_kwargs["cost_kwargs"]["obs_w"] = plain_obs_w
+            plain_kwargs["cost_kwargs"]["terminal_obs_w"] = plain_terminal_obs_w
             ctrl = PlainMPPIClass(
                 dynamics=plain_mod.dyn_diffdrive,
                 running_cost=plain_mod.running_cost_lane_obs,
                 terminal_cost=plain_mod.terminal_cost_track,
-                **common_kwargs,
+                **plain_kwargs,
             )
         elif spec["kind"] == "ra":
             ctrl = RAMPPIClass(
@@ -885,7 +943,7 @@ def main():
                 obs_noise_mode=obs_noise_mode,
                 risk_cost_A=risk_cost_A,
                 risk_cost_Cu=risk_cost_Cu,
-                **common_kwargs,
+                **fresh_common_kwargs(),
             )
         elif spec["kind"] == "dr":
             ctrl = DRMPPIClass(
@@ -899,7 +957,7 @@ def main():
                 dr_eps_cvar=dr_eps_cvar,
                 risk_cost_A=risk_cost_A,
                 risk_cost_Cu=risk_cost_Cu,
-                **common_kwargs,
+                **fresh_common_kwargs(),
             )
         elif spec["kind"] == "dra":
             ctrl = DRAMPPIClass(
@@ -922,7 +980,6 @@ def main():
                     O_mean=None,
                     O_phi=None,
                     radii=None,
-                    obs_w=0.0,
                     ego_half_length=None,
                     ego_half_width=None,
                     obs_half_length=None,
@@ -1038,6 +1095,7 @@ def main():
                     RunMinDistance=rec["run_min_dist"][i],
                     SafetyViolation=rec["safety_violation"][i],
                     Collision=rec["collision"][i],
+                    TotalTrackingControlCost=rec["total_qr_cost"][i],
                     # Keep legacy column name for compatibility with existing plot scripts.
                     TotalQSigmaInvStageCost=rec["total_qr_cost"][i],
                     TotalQRStageCost=rec["total_qr_cost"][i],
@@ -1054,7 +1112,7 @@ def main():
         "2) Run-min distance (mean ± std)",
         "3) Safety violation probability using (r + r_s)",
         "4) Collision probability using (r)",
-        "5) Total cost Q+R only (mean ± std)",
+        "5) Total cost Q+R+Qf over collision-free runs (mean ± std)",
         "6) Max compute time across runs (ms)",
         "7) Run-max compute time (mean ± std) (ms)",
     ]
@@ -1069,7 +1127,8 @@ def main():
 
         safety = np.asarray(rec["safety_violation"], dtype=np.float64)
         coll = np.asarray(rec["collision"], dtype=np.float64)
-        costs = np.asarray(rec["total_qr_cost"], dtype=np.float64)
+        costs_all = np.asarray(rec["total_qr_cost"], dtype=np.float64)
+        costs = costs_all[coll < 0.5]
         tmax_ms = 1000.0 * np.asarray(rec["run_max_compute_time_s"], dtype=np.float64)
 
         col = [
@@ -1094,19 +1153,24 @@ def main():
         run_min_f = run_min[np.isfinite(run_min)]
         safety = np.asarray(rec["safety_violation"], dtype=np.float64)
         coll = np.asarray(rec["collision"], dtype=np.float64)
-        costs = np.asarray(rec["total_qr_cost"], dtype=np.float64)
+        costs_all = np.asarray(rec["total_qr_cost"], dtype=np.float64)
+        costs = costs_all[coll < 0.5]
         tmax_ms = 1000.0 * np.asarray(rec["run_max_compute_time_s"], dtype=np.float64)
         compact_rows.append(
             dict(
                 Algorithm=alg_name,
+                Runs=int(len(costs_all)),
+                CollisionFreeRuns=int(len(costs)),
                 RunMinDistance_Min=float(np.min(run_min_f)) if len(run_min_f) > 0 else np.nan,
                 RunMinDistance_Mean=float(np.mean(run_min_f)) if len(run_min_f) > 0 else np.nan,
                 RunMinDistance_Std=float(np.std(run_min_f, ddof=1)) if len(run_min_f) > 1 else 0.0,
                 SafetyViolation_Prob=float(np.mean(safety)),
                 Collision_Prob=float(np.mean(coll)),
-                TotalQRStageCost_Mean=float(np.mean(costs)),
+                TotalTrackingControlCost_Mean=float(np.mean(costs)) if len(costs) > 0 else np.nan,
+                TotalTrackingControlCost_Std=float(np.std(costs, ddof=1)) if len(costs) > 1 else 0.0,
+                TotalQRStageCost_Mean=float(np.mean(costs)) if len(costs) > 0 else np.nan,
                 TotalQRStageCost_Std=float(np.std(costs, ddof=1)) if len(costs) > 1 else 0.0,
-                TotalQSigmaInvStageCost_Mean=float(np.mean(costs)),
+                TotalQSigmaInvStageCost_Mean=float(np.mean(costs)) if len(costs) > 0 else np.nan,
                 TotalQSigmaInvStageCost_Std=float(np.std(costs, ddof=1)) if len(costs) > 1 else 0.0,
                 RunMaxComputeTimeMs_Max=float(np.max(tmax_ms)) if len(tmax_ms) > 0 else np.nan,
                 RunMaxComputeTimeMs_Mean=float(np.mean(tmax_ms)) if len(tmax_ms) > 0 else np.nan,

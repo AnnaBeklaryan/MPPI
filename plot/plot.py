@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plotly replayer for Crazyflie MPPI variants.
+"""Replay saved Crazyflie MPPI simulations using only Matplotlib.
 
 Examples:
   python plot/plot.py mppi
@@ -14,11 +14,12 @@ import argparse
 import sys
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
-import plotly.graph_objects as go
-import plotly.io as pio
-
-pio.renderers.default = "browser"
+from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+from matplotlib.widgets import Button, Slider
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 PLOT_DIR = Path(__file__).resolve().parent
 MPPI_DIR = PLOT_DIR.parent
@@ -31,9 +32,28 @@ METHODS = {
     "drmppi": ("DR_mppi_crazyflie", "drmppi_simulation.npz"),
     "dramppi": ("DRA_mppi_crazyflie", "dramppi_simulation.npz"),
 }
+LABELS = {
+    "mppi": "MPPI",
+    "ramppi": "RA-MPPI",
+    "drmppi": "DR-MPPI",
+    "dramppi": "DRA-MPPI",
+}
+DRONE_COLORS = {
+    "mppi": "#5B9BFF",
+    "ramppi": "#C56BE3",
+    "drmppi": "#55B8AC",
+    "dramppi": "#FFAA5C",
+}
+OBSTACLE_COLORS = ["#EB1D87", "#34980C", "#EC6613", "#FF8C00"]
 
-CRAZYFLIE_ARM_LEN = 0.044
-LABEL_Z_OFFSET = 0.08
+CRAZYFLIE_ARM_LEN = 0.04
+SCENE_PADDING = np.array([0.20, 0.20, 0.35])
+COMPARE_PADDING = np.array([0.08, 0.08, 0.12])
+SAVED_AXIS_PADDING = 1.0
+AXIS_LABEL_FONTSIZE = 22
+AXIS_TICK_FONTSIZE = 22
+AXIS_LABEL_PAD = 30
+AXIS_TICK_PAD = 9
 
 
 def _saved_path(method: str) -> Path:
@@ -45,833 +65,362 @@ def _load_data(method: str) -> dict[str, np.ndarray]:
     if not path.exists():
         raise FileNotFoundError(f"Missing saved file: {path}")
     with np.load(path, allow_pickle=False) as npz:
-        return {k: npz[k] for k in npz.files}
+        return {key: npz[key] for key in npz.files}
 
 
-def _append_empty_line_traces(fig: go.Figure, count: int, color: str, width: int, dash: str | None = None, name: str | None = None) -> list[int]:
-    idx: list[int] = []
-    line = dict(color=color, width=width)
-    if dash is not None:
-        line["dash"] = dash
-    for i in range(count):
-        fig.add_trace(
-            go.Scatter3d(
-                x=[],
-                y=[],
-                z=[],
-                mode="lines",
-                line=line,
-                name=name if i == 0 else None,
-                showlegend=bool(name and i == 0),
-            )
-        )
-        idx.append(len(fig.data) - 1)
-    return idx
+def _scalar(data: dict[str, np.ndarray], key: str, default: float) -> float:
+    values = np.asarray(data.get(key, default), dtype=float).reshape(-1)
+    return float(values[0]) if values.size and np.isfinite(values[0]) else default
 
 
-def _scalar_from_data(data: dict[str, np.ndarray], key: str, default: float) -> float:
-    value = np.asarray(data.get(key, np.array(default)), dtype=float).reshape(-1)
-    if value.size == 0 or not np.isfinite(value[0]):
-        return float(default)
-    return float(value[0])
+def _flags(data: dict[str, np.ndarray], steps: int) -> np.ndarray:
+    source = np.asarray(data.get("collision_flags", []), dtype=bool).reshape(-1)
+    result = np.zeros(steps, dtype=bool)
+    result[: min(steps, source.size)] = source[:steps]
+    return result
 
 
-def _bool_series_from_data(data: dict[str, np.ndarray], key: str, steps: int) -> np.ndarray:
-    values = np.asarray(data.get(key, np.zeros((steps,), dtype=np.int8))).reshape(-1)
-    flags = np.zeros((steps,), dtype=bool)
-    n = min(steps, values.size)
-    if n > 0:
-        flags[:n] = values[:n].astype(bool)
-    return flags
+def _obstacles(data: dict[str, np.ndarray], steps: int) -> np.ndarray:
+    values = np.asarray(data.get("obs_path", np.zeros((steps, 0, 3))), dtype=float)
+    if values.ndim == 2:
+        values = values[:, None, :]
+    return values[:steps] if values.ndim == 3 else np.zeros((steps, 0, 3))
 
 
-def _fixed_scene(mins: np.ndarray, maxs: np.ndarray) -> dict:
-    mins = np.asarray(mins, dtype=float).reshape(3)
-    maxs = np.asarray(maxs, dtype=float).reshape(3)
+def _bounds(data: dict[str, np.ndarray], paths: list[np.ndarray], compare: bool) -> tuple[np.ndarray, np.ndarray]:
+    if compare:
+        points = list(paths)
+        obs = _obstacles(data, min(len(path) for path in paths))
+        ref = np.asarray(data.get("ref_curve", np.empty((0, 3))), dtype=float)
+        if obs.size:
+            points.append(obs.reshape(-1, 3))
+        if ref.size:
+            points.append(ref.reshape(-1, 3))
+        visible = np.vstack(points)
+        visible = visible[np.all(np.isfinite(visible), axis=1)]
+        return visible.min(axis=0) - COMPARE_PADDING, visible.max(axis=0) + COMPARE_PADDING
+
+    path = paths[0]
+    mins = np.asarray(data.get("mins", path.min(axis=0) - 1.0), dtype=float).reshape(3)
+    maxs = np.asarray(data.get("maxs", path.max(axis=0) + 1.0), dtype=float).reshape(3)
     span = np.maximum(maxs - mins, 1e-6)
-    aspect = span / float(np.max(span))
-    axis_common = dict(
-        autorange=False,
-        gridcolor="#bfc4cc",
-        gridwidth=4,
-        backgroundcolor="#f4f9fc",
-        showbackground=True,
-    )
-    return dict(
-        xaxis=dict(title="X", range=[float(mins[0]), float(maxs[0])], **axis_common),
-        yaxis=dict(title="Y", range=[float(mins[1]), float(maxs[1])], **axis_common),
-        zaxis=dict(title="Altitude", range=[float(mins[2]), float(maxs[2])], **axis_common),
-        aspectmode="manual",
-        aspectratio=dict(x=float(aspect[0]), y=float(aspect[1]), z=float(aspect[2])),
-        dragmode="turntable",
-        bgcolor="#ffffff",
-    )
+    inset = np.minimum(np.maximum(0.0, SAVED_AXIS_PADDING - SCENE_PADDING), span * 0.25)
+    return mins + inset, maxs - inset
 
 
-def _sphere_mesh_trace(
-    center: np.ndarray,
-    radius: float,
-    color: str,
-    name: str | None = None,
-    showlegend: bool = False,
-    opacity: float = 0.10,
-) -> go.Mesh3d:
-    c = np.asarray(center, dtype=float).reshape(3)
-    r = max(float(radius), 1e-6)
-
-    n_lat = 13
-    n_lon = 25
-    theta = np.linspace(0.0, np.pi, n_lat)
-    phi = np.linspace(0.0, 2.0 * np.pi, n_lon, endpoint=False)
-    tt, pp = np.meshgrid(theta, phi, indexing="ij")
-    x = (c[0] + r * np.sin(tt) * np.cos(pp)).reshape(-1)
-    y = (c[1] + r * np.sin(tt) * np.sin(pp)).reshape(-1)
-    z = (c[2] + r * np.cos(tt)).reshape(-1)
-
-    tri_i: list[int] = []
-    tri_j: list[int] = []
-    tri_k: list[int] = []
-    for a in range(n_lat - 1):
-        for b in range(n_lon):
-            p00 = a * n_lon + b
-            p01 = a * n_lon + ((b + 1) % n_lon)
-            p10 = (a + 1) * n_lon + b
-            p11 = (a + 1) * n_lon + ((b + 1) % n_lon)
-            tri_i.extend([p00, p01])
-            tri_j.extend([p10, p10])
-            tri_k.extend([p01, p11])
-
-    return go.Mesh3d(
-        x=x,
-        y=y,
-        z=z,
-        i=tri_i,
-        j=tri_j,
-        k=tri_k,
-        color=color,
-        opacity=opacity,
-        flatshading=False,
-        lighting=dict(ambient=0.85, diffuse=0.35, specular=0.15, roughness=0.9, fresnel=0.35),
-        lightposition=dict(x=100, y=200, z=300),
-        name=name,
-        showlegend=showlegend,
-        hoverinfo="skip",
-        alphahull=0,
-    )
+def _style_axes(ax, mins: np.ndarray, maxs: np.ndarray) -> None:
+    ax.set_xlim(*mins[[0]], *maxs[[0]])
+    ax.set_ylim(*mins[[1]], *maxs[[1]])
+    ax.set_zlim(*mins[[2]], *maxs[[2]])
+    ax.set_xlabel("x [m]", fontsize=AXIS_LABEL_FONTSIZE, color="black", labelpad=AXIS_LABEL_PAD)
+    ax.set_ylabel("y [m]", fontsize=AXIS_LABEL_FONTSIZE, color="black", labelpad=AXIS_LABEL_PAD)
+    ax.set_zlabel("z [m]", fontsize=AXIS_LABEL_FONTSIZE, color="black", labelpad=AXIS_LABEL_PAD)
+    ax.set_facecolor("white")
+    ax.set_box_aspect(np.maximum(maxs - mins, 1e-6), zoom=0.94)
+    ax.view_init(elev=25, azim=-111)
+    pane = (0.957, 0.976, 0.988, 1.0)
+    grid = (0.70, 0.76, 0.82, 0.75)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+    ax.zaxis.set_major_locator(MaxNLocator(nbins=4))
+    compact_number = FuncFormatter(lambda value, _position: f"{0.0 if abs(value) < 1e-12 else value:g}")
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.set_pane_color(pane)
+        axis.set_major_formatter(compact_number)
+        axis._axinfo["grid"]["color"] = grid
+        axis._axinfo["grid"]["linewidth"] = 0.7
+    ax.tick_params(labelsize=AXIS_TICK_FONTSIZE, colors="black", pad=AXIS_TICK_PAD)
+    ax.grid(True, which="major")
 
 
-def _add_cube_plotly(fig: go.Figure, c: np.ndarray) -> None:
-    cx, cy, r, zmin, zmax = [float(v) for v in c]
-    x0, x1 = cx - r, cx + r
-    y0, y1 = cy - r, cy + r
-    z0, z1 = zmin, zmax
-    x = [x0, x1, x1, x0, x0, x1, x1, x0]
-    y = [y0, y0, y1, y1, y0, y0, y1, y1]
-    z = [z0, z0, z0, z0, z1, z1, z1, z1]
-    i = [0, 0, 0, 1, 2, 3, 4, 4, 5, 6, 1, 2]
-    j = [1, 2, 4, 2, 3, 0, 5, 6, 6, 7, 5, 6]
-    k = [2, 4, 5, 3, 0, 4, 6, 7, 7, 4, 6, 7]
-    fig.add_trace(
-        go.Mesh3d(
-            x=x,
-            y=y,
-            z=z,
-            i=i,
-            j=j,
-            k=k,
-            color="#8D959D",
-            opacity=0.42,
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-
-    edges = [
-        ((x0, y0, z0), (x1, y0, z0)), ((x1, y0, z0), (x1, y1, z0)),
-        ((x1, y1, z0), (x0, y1, z0)), ((x0, y1, z0), (x0, y0, z0)),
-        ((x0, y0, z1), (x1, y0, z1)), ((x1, y0, z1), (x1, y1, z1)),
-        ((x1, y1, z1), (x0, y1, z1)), ((x0, y1, z1), (x0, y0, z1)),
-        ((x0, y0, z0), (x0, y0, z1)), ((x1, y0, z0), (x1, y0, z1)),
-        ((x1, y1, z0), (x1, y1, z1)), ((x0, y1, z0), (x0, y1, z1)),
-    ]
-    for p0, p1 in edges:
-        fig.add_trace(
-            go.Scatter3d(
-                x=[p0[0], p1[0]],
-                y=[p0[1], p1[1]],
-                z=[p0[2], p1[2]],
-                mode="lines",
-                line=dict(color="black", width=3),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-
-    h = max(1e-6, z1 - z0)
-    n_floors = max(3, int(h / 0.8))
-    n_cols = 3
-    floor_h = h / (n_floors + 1)
-    win_h = 0.40 * floor_h
-    win_wx = 0.16 * (x1 - x0)
-    win_wy = 0.16 * (y1 - y0)
-    gap_x = ((x1 - x0) - n_cols * win_wx) / (n_cols + 1)
-    gap_y = ((y1 - y0) - n_cols * win_wy) / (n_cols + 1)
-    z_start = z0 + 0.35 * floor_h
-    eps = 0.001
-
-    wx_x, wx_y, wx_z = [], [], []
-    wy_x, wy_y, wy_z = [], [], []
-    for fi in range(n_floors):
-        zb = z_start + fi * floor_h
-        zt = min(zb + win_h, z1 - 0.05 * floor_h)
-        for cj in range(n_cols):
-            xl = x0 + gap_x + cj * (win_wx + gap_x)
-            xr = xl + win_wx
-            wx_x += [xl, xr, xr, xl, xl, None]
-            wx_y += [y1 + eps, y1 + eps, y1 + eps, y1 + eps, y1 + eps, None]
-            wx_z += [zb, zb, zt, zt, zb, None]
-
-            yl = y0 + gap_y + cj * (win_wy + gap_y)
-            yr = yl + win_wy
-            wy_x += [x1 + eps, x1 + eps, x1 + eps, x1 + eps, x1 + eps, None]
-            wy_y += [yl, yr, yr, yl, yl, None]
-            wy_z += [zb, zb, zt, zt, zb, None]
-
-    fig.add_trace(
-        go.Scatter3d(
-            x=wx_x,
-            y=wx_y,
-            z=wx_z,
-            mode="lines",
-            line=dict(color="#2C3E50", width=2),
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-    fig.add_trace(
-        go.Scatter3d(
-            x=wy_x,
-            y=wy_y,
-            z=wy_z,
-            mode="lines",
-            line=dict(color="#2C3E50", width=2),
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
+def _sphere(ax, center: np.ndarray, radius: float, color: str, alpha: float = 0.11) -> None:
+    u = np.linspace(0, 2 * np.pi, 18)
+    v = np.linspace(0, np.pi, 10)
+    x = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+    y = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+    z = center[2] + radius * np.outer(np.ones_like(u), np.cos(v))
+    ax.plot_surface(x, y, z, color=color, alpha=alpha, linewidth=0, shade=False)
 
 
-def _build_plotly_figure(method: str, data: dict[str, np.ndarray], with_predictions: bool = True) -> go.Figure:
-    x_path = np.asarray(data["X_path"], dtype=float)
-    obs_path = np.asarray(data["obs_path"], dtype=float)
-    sim_time = np.asarray(data["sim_time"], dtype=float)
-    solve_ms = np.asarray(data["solve_ms"], dtype=float)
-    ref_curve = np.asarray(data.get("ref_curve", np.empty((0, 3))), dtype=float)
-    cylinders = np.asarray(data.get("cylinders", np.empty((0, 5))), dtype=float)
-
-    if x_path.ndim != 2 or x_path.shape[1] != 3:
-        raise ValueError("X_path must be shaped (N,3).")
-
-    steps = x_path.shape[0]
-    dt = float(data.get("dt", np.median(np.diff(sim_time)) if sim_time.size > 1 else 0.03))
-    mins = np.asarray(data.get("mins", np.min(x_path, axis=0) - 1.0), dtype=float)
-    maxs = np.asarray(data.get("maxs", np.max(x_path, axis=0) + 1.0), dtype=float)
-    drone_radius = _scalar_from_data(data, "drone_radius", 0.3662153322325755)
-    moving_collision_radius = _scalar_from_data(data, "moving_collision_radius", 0.3045201563139591 + drone_radius)
-    obstacle_radius = max(1e-6, moving_collision_radius - drone_radius)
-    collision_flags = _bool_series_from_data(data, "collision_flags", steps)
-    first_collision_step = int(np.argmax(collision_flags)) if np.any(collision_flags) else -1
-
-    if obs_path.ndim == 2:
-        obs_path = obs_path[:, np.newaxis, :]
-    if obs_path.ndim != 3:
-        obs_path = np.zeros((steps, 0, 3), dtype=float)
-    n_obs = obs_path.shape[1]
-    scene_layout = _fixed_scene(mins, maxs)
-
-    pred_samples = None
-    if with_predictions and "pred_samples_xyz" in data:
-        pred_samples = np.asarray(data["pred_samples_xyz"], dtype=float)
-        if pred_samples.ndim != 4:
-            pred_samples = None
-    pred_nominal = None
-    if with_predictions and "pred_nominal_xyz" in data:
-        pred_nominal = np.asarray(data["pred_nominal_xyz"], dtype=float)
-        if pred_nominal.ndim != 3:
-            pred_nominal = None
-
-    fig = go.Figure()
-
-    if ref_curve.size > 0:
-        fig.add_trace(
-            go.Scatter3d(
-                x=ref_curve[:, 0],
-                y=ref_curve[:, 1],
-                z=ref_curve[:, 2],
-                mode="lines",
-                line=dict(color="#2a6fdb", width=4, dash="dot"),
-                name="Reference",
-            )
-        )
-
-    for c in cylinders:
-        _add_cube_plotly(fig, c)
-
-    dynamic_trace_idx: list[int] = []
-    drone_path_idx = _append_empty_line_traces(fig, 1, color="#557EDC", width=4, name="Drone path")[0]
-    dynamic_trace_idx.append(drone_path_idx)
-
-    obs_colors = ["#EB1D87", "#219937", "#EC6613", "#FF8C00"]
-    for j in range(n_obs):
-        c = obs_colors[j % len(obs_colors)]
-        idx = _append_empty_line_traces(fig, 1, color=c, width=4, dash="dot", name=f"Obstacle {j + 1}")[0]
-        dynamic_trace_idx.append(idx)
-    for j in range(n_obs):
-        c = obs_colors[j % len(obs_colors)]
-        idx1 = _append_empty_line_traces(fig, 1, color=c, width=5)[0]
-        idx2 = _append_empty_line_traces(fig, 1, color=c, width=5)[0]
-        dynamic_trace_idx.append(idx1)
-        dynamic_trace_idx.append(idx2)
-    for j in range(n_obs):
-        c = obs_colors[j % len(obs_colors)]
-        fig.add_trace(_sphere_mesh_trace(obs_path[0, j, :], obstacle_radius, c, name=f"Obstacle {j + 1} radius", showlegend=True, opacity=0.09))
-        dynamic_trace_idx.append(len(fig.data) - 1)
-    for j in range(n_obs):
-        po = obs_path[0, j, :]
-        fig.add_trace(
-            go.Scatter3d(
-                x=[po[0]],
-                y=[po[1]],
-                z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
-                mode="text",
-                text=[f"obs {j}"],
-                textfont=dict(color="#111111", size=14),
-                name="Obstacle index" if j == 0 else None,
-                showlegend=(j == 0),
-                hoverinfo="skip",
-            )
-        )
-        dynamic_trace_idx.append(len(fig.data) - 1)
-
-    pred_count = int(pred_samples.shape[2]) if pred_samples is not None else 0
-    for j in range(pred_count):
-        fig.add_trace(
-            go.Scatter3d(
-                x=[],
-                y=[],
-                z=[],
-                mode="lines",
-                line=dict(color="#C70039", width=2),
-                opacity=0.25,
-                name="MPPI samples" if j == 0 else None,
-                showlegend=(j == 0),
-            )
-        )
-        dynamic_trace_idx.append(len(fig.data) - 1)
-
-    if pred_nominal is not None:
-        fig.add_trace(
-            go.Scatter3d(
-                x=[],
-                y=[],
-                z=[],
-                mode="lines",
-                line=dict(color="#C70039", width=5),
-                name="Nominal plan",
-                showlegend=True,
-            )
-        )
-        nominal_idx = len(fig.data) - 1
-        dynamic_trace_idx.append(nominal_idx)
+def _cross(ax, center: np.ndarray, color: str, rotation: np.ndarray | None = None) -> None:
+    if rotation is None:
+        d1 = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+        d2 = np.array([1.0, -1.0, 0.0]) / np.sqrt(2.0)
     else:
-        nominal_idx = -1
+        xb, yb = rotation[:, 0], rotation[:, 1]
+        d1 = (xb + yb) / (np.linalg.norm(xb + yb) + 1e-12)
+        d2 = (xb - yb) / (np.linalg.norm(xb - yb) + 1e-12)
+    for direction in (d1, d2):
+        ends = np.vstack((center - CRAZYFLIE_ARM_LEN * direction, center + CRAZYFLIE_ARM_LEN * direction))
+        ax.plot(*ends.T, color=color, linewidth=2.2)
 
-    fig.add_trace(
-        go.Scatter3d(
-            x=[],
-            y=[],
-            z=[],
-            mode="markers",
-            marker=dict(color="#557EDC", size=4),
-            name="Drone",
-            showlegend=False,
-        )
-    )
-    drone_marker_idx = len(fig.data) - 1
-    dynamic_trace_idx.append(drone_marker_idx)
 
-    fig.add_trace(
-        go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="#557EDC", width=5), showlegend=False)
-    )
-    drone_arm1_idx = len(fig.data) - 1
-    dynamic_trace_idx.append(drone_arm1_idx)
+def _rotation(data: dict[str, np.ndarray], frame: int) -> np.ndarray | None:
+    if "X_hist" not in data or np.asarray(data["X_hist"]).shape[1] < 9:
+        return None
+    psi, phi, theta = np.asarray(data["X_hist"])[frame, 6:9]
+    cp, sp, ct, st, cy, sy = np.cos(phi), np.sin(phi), np.cos(theta), np.sin(theta), np.cos(psi), np.sin(psi)
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    ry = np.array([[ct, 0, st], [0, 1, 0], [-st, 0, ct]])
+    rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+    return rz @ ry @ rx
 
-    fig.add_trace(
-        go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="#557EDC", width=5), showlegend=False)
-    )
-    drone_arm2_idx = len(fig.data) - 1
-    dynamic_trace_idx.append(drone_arm2_idx)
 
-    fig.add_trace(_sphere_mesh_trace(x_path[0], drone_radius, "#557EDC", name="Drone radius", showlegend=True, opacity=0.11))
-    dynamic_trace_idx.append(len(fig.data) - 1)
+def _cube(ax, cube: np.ndarray) -> None:
+    cx, cy, radius, z0, z1 = map(float, cube)
+    x0, x1, y0, y1 = cx - radius, cx + radius, cy - radius, cy + radius
+    vertices = np.array([
+        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+    ])
+    faces = [[vertices[i] for i in face] for face in
+             ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+              (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))]
+    ax.add_collection3d(Poly3DCollection(faces, facecolor="#8D959D", edgecolor="black",
+                                         linewidth=0.7, alpha=0.42))
 
-    fig.add_trace(
-        go.Scatter3d(
-            x=[],
-            y=[],
-            z=[],
-            mode="markers",
-            marker=dict(color="#D00000", size=7, symbol="x", line=dict(color="#D00000", width=4)),
-            name="Collision points",
-            showlegend=True,
-        )
-    )
-    collision_history_idx = len(fig.data) - 1
-    dynamic_trace_idx.append(collision_history_idx)
 
-    fig.add_trace(
-        go.Scatter3d(
-            x=[],
-            y=[],
-            z=[],
-            mode="markers",
-            marker=dict(color="#D00000", size=12, symbol="x", line=dict(color="#D00000", width=6)),
-            name="Current collision",
-            showlegend=True,
-        )
-    )
-    current_collision_idx = len(fig.data) - 1
-    dynamic_trace_idx.append(current_collision_idx)
+def _static_scene(ax, data: dict[str, np.ndarray]) -> None:
+    ref = np.asarray(data.get("ref_curve", np.empty((0, 3))), dtype=float)
+    if ref.size:
+        ax.plot(*ref.T, color="#2a6fdb", linewidth=1.5, linestyle=":", label="Reference")
+    for cube in np.asarray(data.get("cylinders", np.empty((0, 5))), dtype=float):
+        _cube(ax, cube)
 
-    frames: list[go.Frame] = []
-    obs_arm_len = CRAZYFLIE_ARM_LEN
-    obs_d1 = np.array([1.0, 1.0, 0.0], dtype=float)
-    obs_d2 = np.array([1.0, -1.0, 0.0], dtype=float)
-    obs_d1 /= (np.linalg.norm(obs_d1) + 1e-12)
-    obs_d2 /= (np.linalg.norm(obs_d2) + 1e-12)
-    arm_len = CRAZYFLIE_ARM_LEN
-    x_hist = np.asarray(data["X_hist"], dtype=float) if "X_hist" in data else None
-    for i in range(steps):
-        frame_data: list[go.Scatter3d] = []
 
-        frame_data.append(go.Scatter3d(x=x_path[: i + 1, 0], y=x_path[: i + 1, 1], z=x_path[: i + 1, 2]))
-        for j in range(n_obs):
-            frame_data.append(go.Scatter3d(x=obs_path[: i + 1, j, 0], y=obs_path[: i + 1, j, 1], z=obs_path[: i + 1, j, 2]))
-        for j in range(n_obs):
-            po = obs_path[i, j, :]
-            op1a = po - obs_arm_len * obs_d1
-            op1b = po + obs_arm_len * obs_d1
-            op2a = po - obs_arm_len * obs_d2
-            op2b = po + obs_arm_len * obs_d2
-            frame_data.append(go.Scatter3d(x=[op1a[0], op1b[0]], y=[op1a[1], op1b[1]], z=[op1a[2], op1b[2]]))
-            frame_data.append(go.Scatter3d(x=[op2a[0], op2b[0]], y=[op2a[1], op2b[1]], z=[op2a[2], op2b[2]]))
-        for j in range(n_obs):
-            frame_data.append(_sphere_mesh_trace(obs_path[i, j, :], obstacle_radius, obs_colors[j % len(obs_colors)], opacity=0.09))
-        for j in range(n_obs):
-            po = obs_path[i, j, :]
-            frame_data.append(
-                go.Scatter3d(
-                    x=[po[0]],
-                    y=[po[1]],
-                    z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
-                    text=[f"obs {j}"],
-                )
-            )
+def _draw_obstacles(ax, data: dict[str, np.ndarray], obs: np.ndarray, frame: int,
+                    obstacle_radius: float) -> None:
+    for j in range(obs.shape[1]):
+        color = OBSTACLE_COLORS[j % len(OBSTACLE_COLORS)]
+        ax.plot(*obs[:frame + 1, j].T, color=color, linewidth=1.3, linestyle=":",
+                label=f"Obstacle {j + 1}")
+        point = obs[frame, j]
+        _cross(ax, point, color)
+        _sphere(ax, point, obstacle_radius, color, 0.09)
 
-        for j in range(pred_count):
-            pred_xyz = pred_samples[i, :, j, :]
-            valid = np.isfinite(pred_xyz[:, 0])
+
+def _draw_single(ax, method: str, data: dict[str, np.ndarray], frame: int,
+                 mins: np.ndarray, maxs: np.ndarray) -> None:
+    path = np.asarray(data["X_path"], dtype=float)
+    steps = len(path)
+    obs = _obstacles(data, steps)
+    flags = _flags(data, steps)
+    drone_radius = _scalar(data, "drone_radius", 0.3662153322325755)
+    obstacle_radius = max(1e-6, _scalar(data, "moving_collision_radius",
+                                       0.3045201563139591 + drone_radius) - drone_radius)
+    color = "#557EDC"
+
+    ax.cla()
+    _style_axes(ax, mins, maxs)
+    _static_scene(ax, data)
+    _draw_obstacles(ax, data, obs, frame, obstacle_radius)
+
+    ax.plot(*path[:frame + 1].T, color=color, linewidth=1.8, label="Drone path")
+    point = path[frame]
+    ax.scatter(*point, color=color, s=24, depthshade=False)
+    _cross(ax, point, color, _rotation(data, frame))
+    _sphere(ax, point, drone_radius, color)
+
+    samples = np.asarray(data.get("pred_samples_xyz", []), dtype=float)
+    if samples.ndim == 4 and frame < len(samples):
+        for sample in np.moveaxis(samples[frame], 1, 0):
+            valid = np.all(np.isfinite(sample), axis=1)
             if np.any(valid):
-                frame_data.append(go.Scatter3d(x=pred_xyz[valid, 0], y=pred_xyz[valid, 1], z=pred_xyz[valid, 2]))
-            else:
-                frame_data.append(go.Scatter3d(x=[], y=[], z=[]))
+                ax.plot(*sample[valid].T, color="#C70039", linewidth=0.5, alpha=0.25)
+    nominal = np.asarray(data.get("pred_nominal_xyz", []), dtype=float)
+    if nominal.ndim == 3 and frame < len(nominal):
+        valid = np.all(np.isfinite(nominal[frame]), axis=1)
+        if np.any(valid):
+            ax.plot(*nominal[frame, valid].T, color="#C70039", linewidth=1.8)
 
-        if nominal_idx >= 0:
-            nom = pred_nominal[i]
-            valid_nom = np.isfinite(nom[:, 0])
-            if np.any(valid_nom):
-                frame_data.append(go.Scatter3d(x=nom[valid_nom, 0], y=nom[valid_nom, 1], z=nom[valid_nom, 2]))
-            else:
-                frame_data.append(go.Scatter3d(x=[], y=[], z=[]))
-
-        p = x_path[i]
-        frame_data.append(go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]))
-        if x_hist is not None:
-            psi = float(x_hist[i, 6])
-            phi = float(x_hist[i, 7])
-            theta = float(x_hist[i, 8])
-            cphi = np.cos(phi)
-            sphi = np.sin(phi)
-            cth = np.cos(theta)
-            sth = np.sin(theta)
-            cpsi = np.cos(psi)
-            spsi = np.sin(psi)
-            rz = np.array([[cpsi, -spsi, 0.0], [spsi, cpsi, 0.0], [0.0, 0.0, 1.0]])
-            ry = np.array([[cth, 0.0, sth], [0.0, 1.0, 0.0], [-sth, 0.0, cth]])
-            rx = np.array([[1.0, 0.0, 0.0], [0.0, cphi, -sphi], [0.0, sphi, cphi]])
-            rm = rz @ ry @ rx
-            xb = rm[:, 0]
-            yb = rm[:, 1]
-            d1 = (xb + yb) / (np.linalg.norm(xb + yb) + 1e-12)
-            d2 = (xb - yb) / (np.linalg.norm(xb - yb) + 1e-12)
-            p1a, p1b = p - arm_len * d1, p + arm_len * d1
-            p2a, p2b = p - arm_len * d2, p + arm_len * d2
-        else:
-            p1a, p1b = p, p
-            p2a, p2b = p, p
-        frame_data.append(go.Scatter3d(x=[p1a[0], p1b[0]], y=[p1a[1], p1b[1]], z=[p1a[2], p1b[2]]))
-        frame_data.append(go.Scatter3d(x=[p2a[0], p2b[0]], y=[p2a[1], p2b[1]], z=[p2a[2], p2b[2]]))
-        frame_data.append(_sphere_mesh_trace(p, drone_radius, "#557EDC", opacity=0.11))
-        collided_so_far = collision_flags[: i + 1]
-        collision_points = x_path[: i + 1][collided_so_far]
-        if collision_points.size > 0:
-            frame_data.append(
-                go.Scatter3d(
-                    x=collision_points[:, 0],
-                    y=collision_points[:, 1],
-                    z=collision_points[:, 2],
-                )
-            )
-        else:
-            frame_data.append(go.Scatter3d(x=[], y=[], z=[]))
-        if collision_flags[i]:
-            frame_data.append(go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]))
-        else:
-            frame_data.append(go.Scatter3d(x=[], y=[], z=[]))
-
-        collision_text = ""
-        if first_collision_step >= 0 and i >= first_collision_step:
-            collision_text = f" | COLLISION step={first_collision_step}"
-
-        frames.append(
-            go.Frame(
-                data=frame_data,
-                traces=dynamic_trace_idx,
-                name=str(i),
-                layout=go.Layout(
-                    title_text=(
-                        f"{method.upper()} replay | t={sim_time[i]:.2f}s "
-                        f"| solve={solve_ms[i]:.1f}ms"
-                        f"{collision_text}"
-                    ),
-                    scene=scene_layout,
-                ),
-            )
-        )
-
-    fig.frames = frames
-    fig.update_layout(
-        title=f"{method.upper()} replay from saved data",
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        scene=scene_layout,
-        width=1250,
-        height=900,
-        uirevision="fixed-crazyflie-scene",
-        showlegend=False,
-        updatemenus=[
-            {
-                "type": "buttons",
-                "showactive": False,
-                "buttons": [
-                    {
-                        "label": "Play",
-                        "method": "animate",
-                        "args": [None, {"frame": {"duration": int(1000 * dt), "redraw": True}, "fromcurrent": True}],
-                    },
-                    {
-                        "label": "Pause",
-                        "method": "animate",
-                        "args": [[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
-                    },
-                ],
-            }
-        ],
-        sliders=[
-            {
-                "active": 0,
-                "steps": [
-                    {
-                        "args": [[str(i)], {"mode": "immediate", "frame": {"duration": 0, "redraw": True}}],
-                        "label": str(i),
-                        "method": "animate",
-                    }
-                    for i in range(steps)
-                ],
-            }
-        ],
-    )
-    return fig
+    collided = path[:frame + 1][flags[:frame + 1]]
+    if collided.size:
+        ax.scatter(*collided.T, color="#D00000", marker="x", s=34, linewidths=1.6,
+                   depthshade=False)
+    collision = np.flatnonzero(flags)
+    suffix = f"   collision step={collision[0]}" if collision.size and frame >= collision[0] else ""
+    times = np.asarray(data["sim_time"])
+    solve = np.asarray(data["solve_ms"])
+    ax.set_title(f"{method.upper()} replay | t={times[frame]:.2f}s | solve={solve[frame]:.1f}ms{suffix}")
 
 
-def _build_compare_figure(all_data: dict[str, dict[str, np.ndarray]]) -> go.Figure:
-    methods = ["mppi", "ramppi", "drmppi", "dramppi"]
+def _draw_compare(ax, all_data: dict[str, dict[str, np.ndarray]], frame: int,
+                  mins: np.ndarray, maxs: np.ndarray) -> None:
+    methods = list(METHODS)
     base = all_data["mppi"]
+    steps = min(len(all_data[m]["X_path"]) for m in methods)
+    obs = _obstacles(base, steps)
+    base_radius = _scalar(base, "drone_radius", 0.3662153322325755)
+    obstacle_radius = max(1e-6, _scalar(base, "moving_collision_radius",
+                                       0.3045201563139591 + base_radius) - base_radius)
 
-    x_paths = {m: np.asarray(all_data[m]["X_path"], dtype=float) for m in methods}
-    sim_times = {m: np.asarray(all_data[m]["sim_time"], dtype=float) for m in methods}
+    ax.cla()
+    _style_axes(ax, mins, maxs)
+    _static_scene(ax, base)
+    _draw_obstacles(ax, base, obs, frame, obstacle_radius)
 
-    steps = min(x_paths[m].shape[0] for m in methods)
-    collision_flags = {m: _bool_series_from_data(all_data[m], "collision_flags", steps) for m in methods}
-    first_collision_steps = {m: (int(np.argmax(collision_flags[m])) if np.any(collision_flags[m]) else -1) for m in methods}
-    dt = float(base.get("dt", 0.03))
-    sim_time = sim_times["mppi"][:steps]
-    drone_radii = {m: _scalar_from_data(all_data[m], "drone_radius", 0.3662153322325755) for m in methods}
-    base_drone_radius = drone_radii["mppi"]
-    moving_collision_radius = _scalar_from_data(base, "moving_collision_radius", 0.3045201563139591 + base_drone_radius)
-    obstacle_radius = max(1e-6, moving_collision_radius - base_drone_radius)
+    collided_labels = []
+    for method in methods:
+        data = all_data[method]
+        path = np.asarray(data["X_path"], dtype=float)[:steps]
+        flags = _flags(data, steps)
+        color = DRONE_COLORS[method]
+        ax.plot(*path[:frame + 1].T, color=color, linewidth=1.8, label=LABELS[method])
+        point = path[frame]
+        ax.scatter(*point, color=color, s=22, depthshade=False)
+        _sphere(ax, point, _scalar(data, "drone_radius", base_radius), color, 0.09)
+        collision_path = path[:frame + 1].copy()
+        collision_path[~flags[:frame + 1]] = np.nan
+        ax.plot(*collision_path.T, color="#D00000", linewidth=2.2)
+        starts = np.flatnonzero(flags & ~np.r_[False, flags[:-1]])
+        ends = np.flatnonzero(flags & ~np.r_[flags[1:], False])
+        centers = ((starts + ends) // 2)
+        centers = centers[centers <= frame]
+        if centers.size:
+            ax.scatter(*path[centers].T, color="#D00000", marker="*", s=52, depthshade=False)
+        collisions = np.flatnonzero(flags)
+        if collisions.size and frame >= collisions[0]:
+            collided_labels.append(LABELS[method])
 
-    obs_path = np.asarray(base.get("obs_path", np.zeros((steps, 0, 3))), dtype=float)
-    if obs_path.ndim == 2:
-        obs_path = obs_path[:, np.newaxis, :]
-    obs_path = obs_path[:steps]
-    n_obs = obs_path.shape[1] if obs_path.ndim == 3 else 0
+    suffix = f"   collision: {', '.join(collided_labels)}" if collided_labels else ""
+    time = np.asarray(base["sim_time"])[frame]
 
-    ref_curve = np.asarray(base.get("ref_curve", np.empty((0, 3))), dtype=float)
-    cylinders = np.asarray(base.get("cylinders", np.empty((0, 5))), dtype=float)
-    mins = np.asarray(base.get("mins", np.min(np.vstack([x_paths[m][:steps] for m in methods]), axis=0) - 1.0), dtype=float)
-    maxs = np.asarray(base.get("maxs", np.max(np.vstack([x_paths[m][:steps] for m in methods]), axis=0) + 1.0), dtype=float)
-    scene_layout = _fixed_scene(mins, maxs)
 
-    fig = go.Figure()
+def _make_replay(title: str, steps: int, dt: float, draw_frame) -> tuple[plt.Figure, FuncAnimation]:
+    fig = plt.figure(figsize=(14, 10), facecolor="white")
+    ax = fig.add_subplot(111, projection="3d")
+    # 3D axis labels extend beyond the axes' reported bounds, especially the
+    # rotated Y label, so leave a little more room than a 2D plot needs.
+    fig.subplots_adjust(left=0.14, right=0.92, bottom=0.25, top=0.93)
 
-    if ref_curve.size > 0:
-        fig.add_trace(
-            go.Scatter3d(
-                x=ref_curve[:, 0], y=ref_curve[:, 1], z=ref_curve[:, 2],
-                mode="lines",
-                line=dict(color="#2a6fdb", width=4, dash="dot"),
-                name="Reference",
+    slider_ax = fig.add_axes((0.29, 0.045, 0.49, 0.025))
+    slider = Slider(slider_ax, "Frame", 0, steps - 1, valinit=0, valstep=1)
+    play_ax = fig.add_axes((0.03, 0.035, 0.07, 0.045))
+    save_ax = fig.add_axes((0.105, 0.035, 0.08, 0.045))
+    save_all_ax = fig.add_axes((0.19, 0.035, 0.085, 0.045))
+    play = Button(play_ax, "Pause")
+    save = Button(save_ax, "Save SVG")
+    save_all = Button(save_all_ax, "Save All")
+    state = {"playing": True, "updating": False}
+    controls = (slider_ax, play_ax, save_ax, save_all_ax)
+
+    def render(frame: int) -> None:
+        frame = int(frame)
+        draw_frame(ax, frame)
+        if int(slider.val) != frame:
+            state["updating"] = True
+            slider.set_val(frame)
+            state["updating"] = False
+        fig.canvas.draw_idle()
+
+    def tick(frame: int):
+        if not state["playing"]:
+            return ()
+        render(frame)
+        return ()
+
+    animation = FuncAnimation(fig, tick, frames=range(steps), interval=max(1, int(dt * 1000)),
+                              repeat=False, cache_frame_data=False)
+
+    def seek(value: float) -> None:
+        if not state["updating"]:
+            render(int(value))
+
+    def toggle(_event) -> None:
+        state["playing"] = not state["playing"]
+        play.label.set_text("Pause" if state["playing"] else "Play")
+        (animation.event_source.start if state["playing"] else animation.event_source.stop)()
+
+    def write_clean_svg(path: Path) -> None:
+        """Save the scene only, without Matplotlib's interactive controls."""
+        for control in controls:
+            control.set_visible(False)
+        try:
+            fig.canvas.draw()
+            fig.savefig(
+                path,
+                format="svg",
+                facecolor="white",
             )
-        )
-    for c in cylinders:
-        _add_cube_plotly(fig, c)
+        finally:
+            for control in controls:
+                control.set_visible(True)
 
-    dynamic_trace_idx: list[int] = []
-    obs_colors = ["#EB1D87", "#34980C", "#EC6613", "#FF8C00"]
-    for j in range(n_obs):
-        c = obs_colors[j % len(obs_colors)]
-        idx = _append_empty_line_traces(fig, 1, color=c, width=4, dash="dot", name=f"Obstacle {j + 1}")[0]
-        dynamic_trace_idx.append(idx)
-        idx_arm1 = _append_empty_line_traces(fig, 1, color=c, width=5)[0]
-        idx_arm2 = _append_empty_line_traces(fig, 1, color=c, width=5)[0]
-        dynamic_trace_idx.append(idx_arm1)
-        dynamic_trace_idx.append(idx_arm2)
-    for j in range(n_obs):
-        c = obs_colors[j % len(obs_colors)]
-        fig.add_trace(_sphere_mesh_trace(obs_path[0, j, :], obstacle_radius, c, name=f"Obstacle {j + 1} radius", showlegend=True, opacity=0.08))
-        dynamic_trace_idx.append(len(fig.data) - 1)
-    for j in range(n_obs):
-        po = obs_path[0, j, :]
-        fig.add_trace(
-            go.Scatter3d(
-                x=[po[0]],
-                y=[po[1]],
-                z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
-                mode="text",
-                text=[f"obs {j}"],
-                textfont=dict(color="#111111", size=14),
-                name="Obstacle index" if j == 0 else None,
-                showlegend=(j == 0),
-                hoverinfo="skip",
-            )
-        )
-        dynamic_trace_idx.append(len(fig.data) - 1)
+    def save_svg(_event) -> None:
+        path = PLOT_DIR / f"{title}_frame_{int(slider.val):04d}.svg"
+        write_clean_svg(path)
+        print(f"[plot] saved {path}")
 
-    drone_colors = {
-        "mppi": "#095ed5",
-        "ramppi": "#9509b8",
-        "drmppi": "#26867b",
-        "dramppi": "#FF7300",
-    }
-    drone_labels = {
-        "mppi": "MPPI",
-        "ramppi": "RA-MPPI",
-        "drmppi": "DR-MPPI",
-        "dramppi": "DRA-MPPI",
-    }
-    for m in methods:
-        c = drone_colors[m]
-        idx_path = _append_empty_line_traces(fig, 1, color=c, width=5, name=drone_labels[m])[0]
-        dynamic_trace_idx.append(idx_path)
-        fig.add_trace(
-            go.Scatter3d(
-                x=[], y=[], z=[],
-                mode="markers",
-                marker=dict(color=c, size=6),
-                showlegend=False,
-            )
-        )
-        dynamic_trace_idx.append(len(fig.data) - 1)
-        fig.add_trace(_sphere_mesh_trace(x_paths[m][0], drone_radii[m], c, name=f"{drone_labels[m]} radius", showlegend=True, opacity=0.09))
-        dynamic_trace_idx.append(len(fig.data) - 1)
-        fig.add_trace(
-            go.Scatter3d(
-                x=[],
-                y=[],
-                z=[],
-                mode="markers",
-                marker=dict(color="#D00000", size=6, symbol="x", line=dict(color="#D00000", width=4)),
-                name=f"{drone_labels[m]} collision points",
-                showlegend=True,
-            )
-        )
-        dynamic_trace_idx.append(len(fig.data) - 1)
-        fig.add_trace(
-            go.Scatter3d(
-                x=[],
-                y=[],
-                z=[],
-                mode="markers",
-                marker=dict(color="#D00000", size=11, symbol="x", line=dict(color="#D00000", width=6)),
-                name=f"{drone_labels[m]} current collision",
-                showlegend=False,
-            )
-        )
-        dynamic_trace_idx.append(len(fig.data) - 1)
+    def save_all_svgs(_event) -> None:
+        output_dir = PLOT_DIR / f"{title}_frames"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        current_frame = int(slider.val)
+        was_playing = state["playing"]
+        state["playing"] = False
+        animation.event_source.stop()
+        play.label.set_text("Play")
+        try:
+            for frame in range(steps):
+                render(frame)
+                write_clean_svg(output_dir / f"frame_{frame:04d}.svg")
+                if frame == 0 or (frame + 1) % 50 == 0 or frame + 1 == steps:
+                    print(f"[plot] saved {frame + 1}/{steps} frames", flush=True)
+        finally:
+            render(current_frame)
+            state["playing"] = was_playing
+            play.label.set_text("Pause" if was_playing else "Play")
+            if was_playing:
+                animation.event_source.start()
+        print(f"[plot] saved all frames to {output_dir}")
 
-    obs_arm_len = CRAZYFLIE_ARM_LEN
-    obs_d1 = np.array([1.0, 1.0, 0.0], dtype=float)
-    obs_d2 = np.array([1.0, -1.0, 0.0], dtype=float)
-    obs_d1 /= (np.linalg.norm(obs_d1) + 1e-12)
-    obs_d2 /= (np.linalg.norm(obs_d2) + 1e-12)
-
-    frames: list[go.Frame] = []
-    for i in range(steps):
-        frame_data: list[go.Scatter3d] = []
-        for j in range(n_obs):
-            frame_data.append(go.Scatter3d(x=obs_path[: i + 1, j, 0], y=obs_path[: i + 1, j, 1], z=obs_path[: i + 1, j, 2]))
-            po = obs_path[i, j, :]
-            op1a = po - obs_arm_len * obs_d1
-            op1b = po + obs_arm_len * obs_d1
-            op2a = po - obs_arm_len * obs_d2
-            op2b = po + obs_arm_len * obs_d2
-            frame_data.append(go.Scatter3d(x=[op1a[0], op1b[0]], y=[op1a[1], op1b[1]], z=[op1a[2], op1b[2]]))
-            frame_data.append(go.Scatter3d(x=[op2a[0], op2b[0]], y=[op2a[1], op2b[1]], z=[op2a[2], op2b[2]]))
-        for j in range(n_obs):
-            frame_data.append(_sphere_mesh_trace(obs_path[i, j, :], obstacle_radius, obs_colors[j % len(obs_colors)], opacity=0.08))
-        for j in range(n_obs):
-            po = obs_path[i, j, :]
-            frame_data.append(
-                go.Scatter3d(
-                    x=[po[0]],
-                    y=[po[1]],
-                    z=[po[2] + max(LABEL_Z_OFFSET, 1.5 * obstacle_radius)],
-                    text=[f"obs {j}"],
-                )
-            )
-        for m in methods:
-            xp = x_paths[m]
-            frame_data.append(go.Scatter3d(x=xp[: i + 1, 0], y=xp[: i + 1, 1], z=xp[: i + 1, 2]))
-            p = xp[i]
-            frame_data.append(go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]))
-            frame_data.append(_sphere_mesh_trace(p, drone_radii[m], drone_colors[m], opacity=0.09))
-            collided_so_far = collision_flags[m][: i + 1]
-            collision_points = xp[: i + 1][collided_so_far]
-            if collision_points.size > 0:
-                frame_data.append(
-                    go.Scatter3d(
-                        x=collision_points[:, 0],
-                        y=collision_points[:, 1],
-                        z=collision_points[:, 2],
-                    )
-                )
-            else:
-                frame_data.append(go.Scatter3d(x=[], y=[], z=[]))
-            if collision_flags[m][i]:
-                frame_data.append(go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]))
-            else:
-                frame_data.append(go.Scatter3d(x=[], y=[], z=[]))
-
-        collided_methods = [
-            drone_labels[m]
-            for m in methods
-            if first_collision_steps[m] >= 0 and i >= first_collision_steps[m]
-        ]
-        collision_text = f" | COLLISION: {', '.join(collided_methods)}" if collided_methods else ""
-
-        frames.append(
-            go.Frame(
-                data=frame_data,
-                traces=dynamic_trace_idx,
-                name=str(i),
-                layout=go.Layout(title_text=f"Combined replay | t={sim_time[i]:.2f}s{collision_text}", scene=scene_layout),
-            )
-        )
-
-    fig.frames = frames
-    fig.update_layout(
-        title="Combined Replay: MPPI / RA / DR / DRA",
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        scene=scene_layout,
-        width=1250,
-        height=900,
-        uirevision="fixed-crazyflie-scene",
-        showlegend=True,
-        updatemenus=[
-            {
-                "type": "buttons",
-                "showactive": False,
-                "buttons": [
-                    {"label": "Play", "method": "animate", "args": [None, {"frame": {"duration": int(1000 * dt), "redraw": True}, "fromcurrent": True}]},
-                    {"label": "Pause", "method": "animate", "args": [[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}]},
-                ],
-            }
-        ],
-        sliders=[
-            {
-                "active": 0,
-                "steps": [
-                    {"args": [[str(i)], {"mode": "immediate", "frame": {"duration": 0, "redraw": True}}], "label": str(i), "method": "animate"}
-                    for i in range(steps)
-                ],
-            }
-        ],
-    )
-    return fig
+    slider.on_changed(seek)
+    play.on_clicked(toggle)
+    save.on_clicked(save_svg)
+    save_all.on_clicked(save_all_svgs)
+    render(0)
+    # Keep widgets and animation alive for as long as their figure exists.
+    fig._replay_objects = (animation, slider, play, save, save_all)  # type: ignore[attr-defined]
+    return fig, animation
 
 
 def _print_summary(method: str, data: dict[str, np.ndarray]) -> None:
-    solve_ms = np.asarray(data["solve_ms"], dtype=float)
-    collision_count = int(np.count_nonzero(np.asarray(data.get("collision_flags", []), dtype=bool)))
+    solve = np.asarray(data["solve_ms"], dtype=float)
+    collisions = np.count_nonzero(np.asarray(data.get("collision_flags", []), dtype=bool))
     print(
-        f"[{method}] file={_saved_path(method)} steps={data['X_path'].shape[0]} "
-        f"solve_ms(min/mean/max)=({solve_ms.min():.2f}/{solve_ms.mean():.2f}/{solve_ms.max():.2f}) "
-        f"collision_steps={collision_count}"
+        f"[{method}] file={_saved_path(method)} steps={len(data['X_path'])} "
+        f"solve_ms(min/mean/max)=({solve.min():.2f}/{solve.mean():.2f}/{solve.max():.2f}) "
+        f"collision_steps={collisions}"
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay saved Crazyflie MPPI simulations with Plotly.")
-    parser.add_argument("mode", choices=[*METHODS.keys(), "all", "compare"], help="Controller mode to run or replay.")
+    parser = argparse.ArgumentParser(description="Replay saved Crazyflie simulations with Matplotlib.")
+    parser.add_argument("mode", choices=[*METHODS, "all", "compare"])
     args = parser.parse_args()
 
     if args.mode == "compare":
-        all_data = {m: _load_data(m) for m in METHODS}
-        for m in METHODS:
-            _print_summary(m, all_data[m])
-        fig = _build_compare_figure(all_data)
-        fig.show(
-            config={
-                "scrollZoom": True,
-                "displaylogo": False,
-            }
-        )
-        return
+        all_data = {method: _load_data(method) for method in METHODS}
+        for method, data in all_data.items():
+            _print_summary(method, data)
+        paths = [np.asarray(all_data[m]["X_path"], dtype=float) for m in METHODS]
+        steps = min(map(len, paths))
+        mins, maxs = _bounds(all_data["mppi"], [path[:steps] for path in paths], True)
+        dt = _scalar(all_data["mppi"], "dt", 0.03)
+        _make_replay("crazyflie_compare", steps, dt,
+                     lambda ax, i: _draw_compare(ax, all_data, i, mins, maxs))
+    else:
+        selected = list(METHODS) if args.mode == "all" else [args.mode]
+        for method in selected:
+            data = _load_data(method)
+            _print_summary(method, data)
+            path = np.asarray(data["X_path"], dtype=float)
+            mins, maxs = _bounds(data, [path], False)
+            dt = _scalar(data, "dt", 0.03)
+            _make_replay(method, len(path), dt,
+                         lambda ax, i, m=method, d=data, lo=mins, hi=maxs:
+                         _draw_single(ax, m, d, i, lo, hi))
 
-    selected = list(METHODS.keys()) if args.mode == "all" else [args.mode]
-
-    for method in selected:
-        data = _load_data(method)
-        _print_summary(method, data)
-        fig = _build_plotly_figure(method, data, with_predictions=True)
-        fig.show(
-            config={
-                "scrollZoom": True,
-                "displaylogo": False,
-            }
-        )
+    plt.show()
 
 
 if __name__ == "__main__":

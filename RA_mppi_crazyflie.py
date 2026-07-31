@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """
-Buffered RA-MPPI Crazyflie-like quadrotor outer-loop simulation using:
-- RA_MPPI from mppi_class.py (Torch)
-- min-snap reference
-- static cylinders (soft exp cost)
-- moving sphere (soft exp cost) + CVaR feasibility filter in XY via RA_MPPI
+Buffered Torch-MPPI Crazyflie-like quadrotor outer-loop simulation with:
+- minimum-snap drone reference trajectory
+- ONE moving obstacle (sphere) predicted time-ahead
 
-This version:
-- Runs simulation and stores data in buffers
-- Saves buffers to .npz for offline plotting/replay
+Planner:
+- Uses RA_MPPI from mppi_class.py (Torch)
 
 Control: u = [roll_c, pitch_c, yaw_c, thrust]
 State:   x = [px,py,pz, vx,vy,vz, roll, pitch, yaw]
 
-python3 RA_mppi_crazyflie.py  --obs-update-steps 15 --steps 400 --save
+This version:
+- Runs simulation and stores data in buffers
+- Saves buffers to .npz for offline plotting/replay
+- Prints solve time during simulation
+
+python3 "RA_mppi_crazyflie copy.py"  --obs-update-steps 15 --steps 400 --save
 
 """
 
 from __future__ import annotations
 import argparse
+
 import time
 import math
 import os
 from dataclasses import dataclass
+
 import numpy as np
 
 import torch
-
 from mppi_class import RA_MPPI
+from physical_figure8 import evaluate as evaluate_physical_figure8
 
 
 # -----------------------------
@@ -39,6 +43,124 @@ def wrap_pi(a: float) -> float:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+@dataclass
+class SimpleCrazyflieReference:
+    start_position: np.ndarray
+    dt: float = 0.03
+    trajectory_type: str = "tilted_figure8"
+    hover_begin: float = 0.0
+    cycle_time: float = 40.0
+    trajectory_speed: float = 0.6
+    speed_ramp: float = 0.1
+    reverse_direction: bool = False
+    speed_schedule: tuple[tuple[float, float], ...] | None = None
+
+    def __post_init__(self):
+        self.start_position = np.asarray(self.start_position, dtype=float).reshape(3)
+        self.speed_schedule_np = None
+        if self.speed_schedule is not None:
+            schedule = np.asarray(self.speed_schedule, dtype=float)
+            if schedule.ndim != 2 or schedule.shape[1] != 2 or schedule.shape[0] < 1:
+                raise ValueError("speed_schedule must be ((time_s, speed), ...)")
+            order = np.argsort(schedule[:, 0])
+            schedule = schedule[order]
+            schedule[:, 0] = np.maximum(schedule[:, 0], 0.0)
+            schedule[0, 0] = 0.0
+            self.speed_schedule_np = schedule
+        if self.trajectory_type == "tilted_figure8" and self.speed_schedule_np is None:
+            self.cycle_time = (2.0 * math.pi) / max(1e-6, float(self.trajectory_speed))
+        self.total_time = float(self.hover_begin + self.cycle_time)
+
+    @staticmethod
+    def _square_progress(t: float, side_length: float, speed: float):
+        segment_time = side_length / speed
+        cycle_time = 4.0 * segment_time
+        t_cycle = t % cycle_time
+
+        if t_cycle < segment_time:
+            s = t_cycle / segment_time
+            pos_uv = np.array([side_length * s, 0.0], dtype=float)
+            vel_uv = np.array([speed, 0.0], dtype=float)
+        elif t_cycle < 2.0 * segment_time:
+            s = (t_cycle - segment_time) / segment_time
+            pos_uv = np.array([side_length, side_length * s], dtype=float)
+            vel_uv = np.array([0.0, speed], dtype=float)
+        elif t_cycle < 3.0 * segment_time:
+            s = (t_cycle - 2.0 * segment_time) / segment_time
+            pos_uv = np.array([side_length * (1.0 - s), side_length], dtype=float)
+            vel_uv = np.array([-speed, 0.0], dtype=float)
+        else:
+            s = (t_cycle - 3.0 * segment_time) / segment_time
+            pos_uv = np.array([0.0, side_length * (1.0 - s)], dtype=float)
+            vel_uv = np.array([0.0, -speed], dtype=float)
+
+        return pos_uv, vel_uv
+
+    @staticmethod
+    def _yaw_follow_from_vel(v: np.ndarray, fallback: float = 0.0) -> float:
+        vx, vy = float(v[0]), float(v[1])
+        if vx * vx + vy * vy < 1e-6:
+            return fallback
+        return math.atan2(vy, vx)
+
+    def _phase_and_speed(self, t: float):
+        if self.speed_schedule_np is None:
+            return float(self.trajectory_speed) * t, float(self.trajectory_speed)
+
+        schedule = self.speed_schedule_np
+        phase = 0.0
+        last_t = 0.0
+        speed = float(schedule[0, 1])
+        for next_t, next_speed in schedule[1:]:
+            next_t = float(next_t)
+            if t <= next_t:
+                phase += speed * max(0.0, t - last_t)
+                return phase, speed
+            phase += speed * max(0.0, next_t - last_t)
+            last_t = next_t
+            speed = float(next_speed)
+        phase += speed * max(0.0, t - last_t)
+        return phase, speed
+
+    def _pos_vel(self, t: float):
+        if t < self.hover_begin:
+            return self.start_position.copy(), np.zeros(3, dtype=float)
+
+        t = float(t - self.hover_begin) % max(1e-9, float(self.cycle_time))
+        direction = -1.0 if self.reverse_direction else 1.0
+
+        if self.trajectory_type == "tilted_figure8":
+            phase, omega = self._phase_and_speed(t)
+            s = direction * phase
+            p, v = evaluate_physical_figure8(
+                s, direction * omega, self.start_position, x_peak=0.5, y_peak=0.2
+            )
+        elif self.trajectory_type == "tilted_square":
+            side_length = 1.0
+            speed = self.trajectory_speed
+            pos_uv, vel_uv = self._square_progress(t, side_length, speed)
+            dir_1 = np.array([1.0, 0.0, 0.0], dtype=float)
+            dir_2 = np.array([0.0, 1.0, 0.6], dtype=float)
+            dir_2 = dir_2 / np.linalg.norm(dir_2)
+            p = self.start_position + pos_uv[0] * dir_1 + pos_uv[1] * dir_2
+            v = direction * (vel_uv[0] * dir_1 + vel_uv[1] * dir_2)
+        elif self.trajectory_type == "point":
+            p = self.start_position.copy()
+            v = np.zeros(3, dtype=float)
+        else:
+            raise ValueError(f"Unknown trajectory_type: {self.trajectory_type}")
+
+        return p, v
+
+    def eval(self, t: float, yaw_fallback: float = 0.0):
+        p, v = self._pos_vel(t)
+        yaw = self._yaw_follow_from_vel(v, yaw_fallback)
+        return np.array(
+            [p[0], p[1], p[2], v[0], v[1], v[2], 0.0, 0.0, yaw],
+            dtype=float,
+        )
 
 
 # -----------------------------
@@ -177,13 +299,10 @@ def build_min_snap_3d(waypoints_xyz, avg_speed=1.5):
 
 
 # ============================================================
-# Torch dynamics & costs for RA_MPPI
+# Torch dynamics & costs
 # ============================================================
 def _wrap_pi_torch(a: torch.Tensor) -> torch.Tensor:
     return (a + torch.pi) % (2.0 * torch.pi) - torch.pi
-
-
-STATIC_BUILDING_RADIUS_SCALE = math.sqrt(2.0)
 
 
 def _z_body_world_torch(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
@@ -196,7 +315,7 @@ def _z_body_world_torch(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tens
     return torch.stack([zx, zy, zz], dim=-1)
 
 
-def quad_dyn_step(X: torch.Tensor, U: torch.Tensor, dt: float, m: float, g: float, **_kwargs) -> torch.Tensor:
+def quad_dyn_step(X, U, dt, m, g, **_kwargs):
     # X: (M,9) [px,py,pz,vx,vy,vz,roll,pitch,yaw]
     p = X[:, 0:3]
     v = X[:, 3:6]
@@ -229,141 +348,158 @@ def quad_dyn_step(X: torch.Tensor, U: torch.Tensor, dt: float, m: float, g: floa
     return torch.cat([p_next, v_next, roll_next[:, None], pitch_next[:, None], yaw_next[:, None]], dim=1)
 
 
-def running_cost_ra(
-    X: torch.Tensor, U: torch.Tensor, t: int,
-    ref_seq: torch.Tensor,   # (T+1,4)
-    Q: torch.Tensor,         # (4,)
-    R: torch.Tensor,         # (4,)
-    # cylinders packed (Nc,5) or None
-    cyl_pack: torch.Tensor | None = None,
-    w_cyl: float = 350.0,
-    cyl_margin: float = 0.25,
-    cyl_alpha: float = 10.0,
-    drone_radius: float = 0.0,
-    # control smoothing around nominal sequence from previous iteration/warm-start
-    U_nom: torch.Tensor | None = None,   # (T,4)
-    Rd: torch.Tensor | None = None,      # (4,)
+def running_cost_quad(
+    X, U, t,
+    ref_seq, Q, R,
+    drone_radius=0.0,
+    obs_seq=None,
+    moving_r=0.35, moving_safety_margin=0.50,
+    U_nom=None, Rd=None,
     **_kwargs
-) -> torch.Tensor:
-    # tracking
-    ref = ref_seq[t + 1]
-    e_pos = X[:, 0:3] - ref[None, 0:3]
-    e_yaw = _wrap_pi_torch(X[:, 8] - ref[3]).unsqueeze(1)
-    e = torch.cat([e_pos, e_yaw], dim=1)  # (M,4)
-    J = torch.sum((e * e) * Q[None, :], dim=1) + torch.sum((U * U) * R[None, :], dim=1)
+):
+    ref = ref_seq[t + 1]  # (9,) [pos, vel, roll, pitch, yaw]
+    e = X - ref[None, :]
+    e[:, 6:9] = _wrap_pi_torch(e[:, 6:9])
 
-    # Optional control-smoothing penalty: ||u_t - u_nom_t||_Rd^2
+    J = torch.sum((e * e) * Q[None, :], dim=1) + torch.sum((U * U) * R[None, :], dim=1)
     if (U_nom is not None) and (Rd is not None):
         du = U - U_nom[t][None, :]
         J = J + torch.sum((du * du) * Rd[None, :], dim=1)
 
-    # cylinders: exp(-alpha * signed_xy) within z gate
-    if cyl_pack is not None and cyl_pack.numel() > 0:
-        px = X[:, 0:1]
-        py = X[:, 1:2]
-        pz = X[:, 2:3]
-
-        cx = cyl_pack[:, 0][None, :]
-        cy = cyl_pack[:, 1][None, :]
-        rr = cyl_pack[:, 2][None, :]
-        zmin = cyl_pack[:, 3][None, :]
-        zmax = cyl_pack[:, 4][None, :]
-
-        dx = px - cx
-        dy = py - cy
-        dxy = torch.sqrt(dx*dx + dy*dy)
-        signed = dxy - (rr + float(cyl_margin) + float(drone_radius))
-        z_gate_margin = float(cyl_margin) + float(drone_radius)
-        inside = (pz >= (zmin - z_gate_margin)) & (pz <= (zmax + z_gate_margin))
-        pen = torch.exp(-float(cyl_alpha) * signed)
-        pen = torch.where(inside, pen, torch.zeros_like(pen))
-        J = J + float(w_cyl) * torch.sum(pen, dim=1)
 
     return J
 
 
-def terminal_cost_ra(
-    X: torch.Tensor, t_final: int,
-    ref_seq: torch.Tensor,
-    Qf: torch.Tensor,
-    **_kwargs
-) -> torch.Tensor:
+def terminal_cost_quad(
+    X,
+    t_final,
+    ref_seq,
+    Qf,
+    drone_radius=0.0,
+    obs_seq=None,
+    moving_r=0.35,
+    moving_safety_margin=0.50,
+    **_kwargs,
+):
     ref = ref_seq[-1]
-    e_pos = X[:, 0:3] - ref[None, 0:3]
-    e_yaw = _wrap_pi_torch(X[:, 8] - ref[3]).unsqueeze(1)
-    e = torch.cat([e_pos, e_yaw], dim=1)
-    return torch.sum((e * e) * Qf[None, :], dim=1)
+    e = X - ref[None, :]
+    e[:, 6:9] = _wrap_pi_torch(e[:, 6:9])
+    J = torch.sum((e * e) * Qf[None, :], dim=1)
 
 
-# ============================================================
-# RA MPPI controller wrapper (uses RA_MPPI from mppi_class.py)
-# ============================================================
+    return J
+
+
+def _state_error_cost_np(x, ref, Q):
+    e = np.asarray(x, dtype=float) - np.asarray(ref, dtype=float)
+    e[6:9] = np.array([wrap_pi(float(v)) for v in e[6:9]], dtype=float)
+    return float(np.sum((e * e) * np.asarray(Q, dtype=float)))
+
+
+def _cvar_tail_mean_np(values, alpha):
+    vals = np.sort(np.asarray(values, dtype=float).reshape(-1))
+    if vals.size == 0:
+        return 0.0
+    tail_n = max(1, int(math.ceil((1.0 - float(alpha)) * vals.size)))
+    return float(np.mean(vals[-tail_n:]))
+
+
+def _executed_cvar_risk_cost_np(x, obs_now, params, rng):
+    if obs_now is None or float(params.risk_cost_A) <= 0.0:
+        return 0.0
+    obs_points = np.asarray(obs_now, dtype=float).reshape(-1, 3)
+    if obs_points.size == 0:
+        return 0.0
+    sigma = np.asarray(params.obs_pos_sigma_xyz, dtype=float).reshape(1, 1, 3)
+    samples = obs_points[:, None, :] + rng.normal(
+        loc=0.0,
+        scale=sigma,
+        size=(obs_points.shape[0], int(params.cvar_N), 3),
+    )
+    safe_r = float(params.moving_r) + float(params.moving_safety_margin) + float(params.drone_radius)
+    dists = np.linalg.norm(samples - np.asarray(x, dtype=float)[None, None, 0:3], axis=-1)
+    violations = safe_r - dists
+    cvars = np.array([_cvar_tail_mean_np(v, params.cvar_alpha) for v in violations], dtype=float)
+    cvar_max = float(np.max(cvars)) if cvars.size else 0.0
+    if cvar_max > float(params.risk_cost_Cu):
+        return float(params.risk_cost_A) * cvar_max
+    return 0.0
+
+
+def _executed_tracking_stage_cost_np(x, u, ref, Q, R, u_nom, Rd):
+    u = np.asarray(u, dtype=float).reshape(4)
+    total = _state_error_cost_np(x, ref, Q)
+    total += float(np.sum((u * u) * np.asarray(R, dtype=float).reshape(4)))
+    if u_nom is not None and Rd is not None:
+        du = u - np.asarray(u_nom, dtype=float).reshape(4)
+        total += float(np.sum((du * du) * np.asarray(Rd, dtype=float).reshape(4)))
+    return float(total)
+
+
+def _executed_full_stage_cost_np(x, u, ref, Q, R, u_nom, Rd, params, obs_now, rng):
+    total = _executed_tracking_stage_cost_np(x, u, ref, Q, R, u_nom, Rd)
+    total += _executed_cvar_risk_cost_np(x, obs_now, params, rng)
+    return float(total)
+
+
+# -----------------------------
+# RA-MPPI wrapper (Torch)
+# -----------------------------
 @dataclass
-class Params:
+class RAMPPIParams:
     dt: float = 0.02
-    horizon_steps: int = 60
-    rollouts: int = 1200
+    horizon_steps: int = 40
+    rollouts: int = 500
     lam: float = 1.0
-
-    # bounds
-    ang_max: float = math.radians(25.0)
+    sigma: np.ndarray | None = None
+    R_u: tuple[float, float, float, float] | None = None
+    T_min: float = 0.0
+    T_max: float = 0.0
+    # ang_max: float = math.radians(25.0)
+    ang_max: float = math.radians(40.0)
     yaw_max: float = math.radians(200.0)
-    # first-order attitude response (addresses roll/pitch command chatter)
     tau_roll: float = 0.14
     tau_pitch: float = 0.14
     tau_yaw: float = 0.14
 
-    # costs
-    w_cyl: float = 350.0
-    cyl_margin: float = 0.25
-    cyl_alpha: float = 10.0
-
-    # moving obstacle geometry for RA/CVaR feasibility
-    moving_r: float = 0.35
-    moving_margin: float = 0.50
-
     drone_radius: float = 0.25
 
-    # RA CVaR settings (XYZ, matching DR_mppi_crazyflie.py)
-    cvar_alpha: float = 0.9
-    cvar_N: int = 30
-    obs_pos_sigma_xyz: tuple[float, float, float] = (0.25, 0.25, 0.25)
-    noise_mode: str = "static"
+    moving_r: float = 0.35
+    moving_safety_margin: float = 0.50
+    obs_pos_sigma_xyz: tuple[float, float, float] = (0.01, 0.01, 0.01)
+    noise_mode: str = "per_step"
+    cvar_alpha: float = 0.95
+    cvar_N: int = 50
     risk_cost_A: float = 0.0
     risk_cost_Cu: float = 0.0
-
-    R_u: tuple[float, float, float, float] = (89.02855474122688, 78.6985310400259, 45.39197083517131, 510.23579553553077)
-    # extra running-cost penalty on control deviation from nominal sequence
     Rd_u: tuple[float, float, float, float] = (3.0, 3.0, 0.5, 0.0)
 
 
-class TorchRAQuad:
-    def __init__(self, mass=0.028, g=9.81, params: Params | None = None, cylinders=None, device=None):
+class TorchRAMPPIQuadOuter:
+    def __init__(self, mass=0.028, g=9.81, params: RAMPPIParams | None = None, device=None):
         self.m = float(mass)
         self.g = float(g)
-        self.p = params if params is not None else Params()
+        self.p = params if params is not None else RAMPPIParams()
 
         hover = self.m * self.g
+        if self.p.T_max <= 0.0:
+            self.p.T_max = 2.0 * hover
+        if self.p.T_min < 0.0:
+            self.p.T_min = 0.0
 
-        # thrust bounds
-        T_min = 0.0
-        T_max = 2.0 * hover
+        if self.p.sigma is None:
+            self.p.sigma = np.array([math.radians(8.0), math.radians(8.0), math.radians(40.0), 0.15*hover], dtype=np.float32)
 
-        # control noise std (diag)
-        sigma = np.array(
-            [
-                math.radians(6.072834867326699),
-                math.radians(7.139534744261536),
-                math.radians(9.50181217517332),
-                0.03860791271607059,
-            ],
-            dtype=np.float32,
-        )
 
-        self.u_min = np.array([-self.p.ang_max, -self.p.ang_max, -self.p.yaw_max, T_min], dtype=np.float32)
-        self.u_max = np.array([self.p.ang_max, self.p.ang_max, self.p.yaw_max, T_max], dtype=np.float32)
+        self.u_min = np.array([-self.p.ang_max, -self.p.ang_max, -self.p.yaw_max, self.p.T_min], dtype=np.float32)
+        self.u_max = np.array([self.p.ang_max, self.p.ang_max, self.p.yaw_max, self.p.T_max], dtype=np.float32)
 
-        self.R_np = np.asarray(self.p.R_u, dtype=np.float32).reshape(4,)
+        sigma_np = np.asarray(self.p.sigma, dtype=np.float32).reshape(4,)
+        if self.p.R_u is None:
+            self.R_np = 1.0 / np.maximum(sigma_np ** 2, 1e-12).astype(np.float32)
+        else:
+            self.R_np = np.asarray(self.p.R_u, dtype=np.float32).reshape(4,)
+
         self.Rd_np = np.asarray(self.p.Rd_u, dtype=np.float32).reshape(4,)
 
         self.dt = float(self.p.dt)
@@ -374,29 +510,17 @@ class TorchRAQuad:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        # cylinders pack (Nc,5): [cx,cy,r,zmin,zmax]
-        cyls = cylinders if cylinders is not None else []
-        if len(cyls) > 0:
-            pack = torch.tensor(
-                [[c["cx"], c["cy"], STATIC_BUILDING_RADIUS_SCALE * c["r"], c.get("zmin", -1e9), c.get("zmax", 1e9)] for c in cyls],
-                device=self.device, dtype=torch.float32
-            )
-        else:
-            pack = None
-        self.cyl_pack = pack
-
-        # RA_MPPI instance
         self.mppi = RA_MPPI(
             dt=self.dt,
             T=self.T,
             M=self.M,
             lam=float(self.p.lam),
-            noise_sigma=sigma,          # diag => stable
+            noise_sigma=np.asarray(self.p.sigma, dtype=np.float32),
             u_min=self.u_min,
             u_max=self.u_max,
             dynamics=quad_dyn_step,
-            running_cost=running_cost_ra,
-            terminal_cost=terminal_cost_ra,
+            running_cost=running_cost_quad,
+            terminal_cost=terminal_cost_quad,
             device=self.device,
             dtype=torch.float32,
             dyn_kwargs=dict(
@@ -407,22 +531,12 @@ class TorchRAQuad:
                 tau_yaw=self.p.tau_yaw,
             ),
             cost_kwargs=dict(
-                # updated each plan():
-                ref_seq=None, Q=None, Qf=None, R=None,
-                # RA obstacle fields (XY only):
+                ref_seq=None, Q=None, Qf=None, R=None, obs_seq=None,
                 O_mean=None, radii=None,
-
-                # cylinders:
-                cyl_pack=self.cyl_pack,
-                w_cyl=self.p.w_cyl,
-                cyl_margin=self.p.cyl_margin,
-                cyl_alpha=self.p.cyl_alpha,
-
                 drone_radius=self.p.drone_radius,
-
-                # control smoothing
-                U_nom=None,
-                Rd=None,
+                moving_r=self.p.moving_r,
+                moving_safety_margin=self.p.moving_safety_margin,
+                U_nom=None, Rd=None,
             ),
             cvar_alpha=float(self.p.cvar_alpha),
             cvar_N=int(self.p.cvar_N),
@@ -433,7 +547,7 @@ class TorchRAQuad:
             verbose=False,
         )
 
-        # warm start U = hover thrust
+        # warm-start: hover thrust
         self.mppi.U_cpu[:] = 0.0
         self.mppi.U_cpu[:, 3] = hover
         self.mppi.U = self.mppi.U_cpu
@@ -456,22 +570,21 @@ class TorchRAQuad:
 
     def plan(
         self,
-        x0_np: np.ndarray,
-        ref_seq_np: np.ndarray,
-        Q_np: np.ndarray,
-        Qf_np: np.ndarray,
-        obs_seq_np: np.ndarray | None,
-        return_predictions: bool = False,
-        n_pred: int = 20,
-        include_nominal_prediction: bool = True,
+        x0_np,
+        ref_seq_np,
+        Q_np,
+        Qf_np,
+        obs_seq_np,
+        return_predictions=False,
+        n_pred=20,
+        include_nominal_prediction=True,
     ):
         ref_seq_t = torch.as_tensor(ref_seq_np, device=self.device, dtype=torch.float32)
         Q_t  = torch.as_tensor(Q_np,  device=self.device, dtype=torch.float32)
         Qf_t = torch.as_tensor(Qf_np, device=self.device, dtype=torch.float32)
         R_t  = torch.as_tensor(self.R_np, device=self.device, dtype=torch.float32)
-
-        if obs_seq_np is not None:
-            obs_seq_t = torch.as_tensor(obs_seq_np, device=self.device, dtype=torch.float32)
+        obs_seq_t = torch.as_tensor(obs_seq_np, device=self.device, dtype=torch.float32) if obs_seq_np is not None else None
+        if obs_seq_t is not None:
             if obs_seq_t.ndim == 2:
                 O_mean = obs_seq_t[1:self.T+1, 0:3].unsqueeze(1)  # (T,1,3)
                 K = 1
@@ -480,12 +593,9 @@ class TorchRAQuad:
                 K = int(obs_seq_t.shape[1])
             else:
                 raise ValueError(f"obs_seq_np must be (T+1,3) or (T+1,K,3), got shape={tuple(obs_seq_t.shape)}")
-
-            # effective collision radius in XYZ (sphere approximation)
-            R_eff = float(self.p.moving_r + self.p.drone_radius + self.p.moving_margin)
-            radii = torch.full((K,), R_eff, device=self.device, dtype=torch.float32)
+            safe_R = float(self.p.moving_r + self.p.moving_safety_margin + self.p.drone_radius)
+            radii = torch.full((K,), safe_R, device=self.device, dtype=torch.float32)
         else:
-            obs_seq_t = None
             O_mean = None
             radii = None
 
@@ -494,6 +604,7 @@ class TorchRAQuad:
         ck["Q"] = Q_t
         ck["Qf"] = Qf_t
         ck["R"] = R_t
+        ck["obs_seq"] = obs_seq_t
         ck["O_mean"] = O_mean
         ck["radii"] = radii
         ck["U_nom"] = torch.as_tensor(self.mppi.U_cpu, device=self.device, dtype=torch.float32)
@@ -514,7 +625,7 @@ class TorchRAQuad:
             if include_nominal_prediction:
                 pred_nominal_xyz = self._predict_nominal_xyz(x0_np, U_cpu)
 
-        # shift warm-start
+        # warm-start shift
         self.mppi.U_cpu[:-1] = self.mppi.U_cpu[1:]
         self.mppi.U_cpu[-1] = self.mppi.U_cpu[-2]
         self.mppi.U = self.mppi.U_cpu
@@ -523,99 +634,102 @@ class TorchRAQuad:
         return u0
 
 
-# ============================================================
-# Buffered simulation
-# ============================================================
+# -----------------------------
+# Buffered Simulation / Data Export
+# -----------------------------
 def simulate(
     save_dir: str | None = None,
     obs_update_steps: int = 1,
     use_gpu: bool = True,
     sim_steps: int | None = None,
 ):
-    waypoints = np.array([
-        [ 2.5,  2.0, 0.0],
-        [ 0.0,  3.5, 2.0],
-        [-3.0,  1.5, 4.5],
-        [-2.0, -2.5, 3.0],
-        [ 2.0, -3.0, 1.0],
-        [ 3.0,  0.0, 0.5],
-        [ 2.5,  2.0, 0.0],
-    ], dtype=float)
-
-    cylinders = [
-        {"cx":  0.5, "cy":  1.0, "r": 0.6, "zmin": 0.0, "zmax": 4.5},
-        {"cx": -1.8, "cy": -0.5, "r": 0.7, "zmin": 0.0, "zmax": 5.0},
-        {"cx":  1.5, "cy": -1.8, "r": 0.5, "zmin": 0.0, "zmax": 3.0},
-        {"cx": -1.0, "cy":  4.0, "r": 0.7, "zmin": 0.0, "zmax": 4.5},
+    trajectory_type = "tilted_figure8"
+    trajectory_center = np.array([0.0, -0.8, 2.4], dtype=float)
+    ego_ref_speed = 0.6
+    obstacle_ref_speed = 0.5
+    moving_speed_schedules = [
+        ((0.0, 0.50), (0.50, 2.70), (0.62, 0.50), (1.10, 2.50), (1.22, 0.50), (1.70, 2.80), (1.82, 0.50), (2.35, 2.60), (2.47, 0.50), (3.05, 2.70), (3.18, 0.50), (3.75, 2.50), (3.88, 0.50), (4.45, 2.80), (4.57, 0.50), (5.15, 2.60), (5.28, 0.50), (5.90, 2.70), (6.02, 0.50), (6.60, 2.50), (6.72, 0.50), (7.30, 2.80), (7.43, 0.50), (8.05, 2.60), (8.18, 0.50), (8.80, 2.70), (8.92, 0.50), (9.50, 2.50), (9.62, 0.50), (10.20, 2.80), (10.32, 0.50), (10.82, 2.60), (10.94, 0.50), (11.42, 2.70), (11.54, 0.50), (12.12, 2.50), (12.24, 0.50), (12.82, 2.80), (12.94, 0.50), (13.52, 2.60), (13.64, 0.50), (14.22, 2.70), (14.34, 0.50), (14.92, 2.50), (15.04, 0.50)),
+        ((0.0, 0.50), (0.35, 2.60), (0.48, 0.50), (0.95, 2.80), (1.07, 0.50), (1.55, 2.50), (1.68, 0.50), (2.15, 2.70), (2.27, 0.50), (2.85, 2.60), (2.98, 0.50), (3.50, 2.80), (3.62, 0.50), (4.20, 2.50), (4.33, 0.50), (4.90, 2.70), (5.03, 0.50), (6.07, 2.60), (6.60, 0.50), (6.77, 2.80), (6.90, 0.50), (7.47, 2.50), (7.59, 0.50), (8.22, 2.70), (8.35, 0.50), (8.92, 2.60), (9.04, 0.50), (9.62, 2.80), (9.75, 0.50), (10.32, 2.50), (10.44, 0.50), (11.07, 2.70), (11.20, 0.50), (11.77, 2.60), (11.89, 0.50), (12.47, 2.80), (12.60, 0.50), (13.17, 2.50), (13.29, 0.50), (13.92, 2.70), (14.05, 0.50), (14.62, 2.60), (14.74, 0.50), (14.87, 2.80), (14.99, 0.50)),
     ]
-
-    traj = build_min_snap_3d(waypoints[::-1], avg_speed=1.8)
-
-    # Moving Crazyflies use the same waypoint loop, translated by small offsets
-    # so they fly on separated copies of the trajectory.
-    n_moving_obstacles = 4
-    moving_offsets = np.array([
-        [-0.25,  0.60, 0.00],
-        [-0.65, -0.45, 0.00],
-        [ 0.45, -0.60, 0.00],
-        [ 1.10,  0.60, 0.00],
-    ], dtype=float)
-    moving_waypoint_sets = [
-        waypoints + moving_offsets[j][None, :]
-        for j in range(n_moving_obstacles)
-    ]
-    moving_time_offsets = np.linspace(
-        0.0,
-        traj.total_time * (n_moving_obstacles - 1) / n_moving_obstacles,
-        n_moving_obstacles,
-        dtype=float,
+    traj = SimpleCrazyflieReference(
+        start_position=trajectory_center,
+        dt=0.02,
+        trajectory_type=trajectory_type,
+        hover_begin=0.0,
+        trajectory_speed=ego_ref_speed,
     )
 
     moving_trajs = [
-        build_min_snap_3d(wp, avg_speed=2.7)
-        for wp in moving_waypoint_sets
+        SimpleCrazyflieReference(
+            start_position=trajectory_center,
+            dt=0.03,
+            trajectory_type=trajectory_type,
+            hover_begin=0.0,
+            trajectory_speed=obstacle_ref_speed,
+            reverse_direction=True,
+            speed_schedule=moving_speed_schedules[0],
+        ),
+        SimpleCrazyflieReference(
+            start_position=trajectory_center,
+            dt=0.03,
+            trajectory_type=trajectory_type,
+            hover_begin=0.0,
+            trajectory_speed=obstacle_ref_speed,
+            reverse_direction=True,
+            speed_schedule=moving_speed_schedules[1],
+        ),
     ]
-
-    p = Params(
-        dt=0.03,
-        horizon_steps=35,
-        rollouts=1200,
-        lam=2,
-        ang_max=math.radians(28.533048677493525),
-        yaw_max=math.radians(125.002671219858),
-        tau_roll=0.22445102088241203,
-        tau_pitch=0.19182828711184713,
-        tau_yaw=0.22445102088241203,
-        w_cyl=510.6988597095838,
-        cyl_margin=0.2150292356967072,
-        cyl_alpha=8.72155294537059,
-        moving_r=0.3045201563139591,
-        moving_margin=0.0,
-        drone_radius=0.4,
-        cvar_alpha=0.95,
-        cvar_N=50,
-        obs_pos_sigma_xyz=(0.07, 0.07, 0.07),
-        noise_mode="per_step",
-        risk_cost_A=10.0,
-        risk_cost_Cu=0.0,
-        R_u=(1, 1, 1, 1),
-        Rd_u=(1, 1, 1, 1),
+    n_moving_obstacles = len(moving_trajs)
+    moving_time_offsets = np.array(
+        [0.0, moving_trajs[1].total_time * 0.09],
+        dtype=float,
     )
 
+    params = RAMPPIParams(
+        dt=0.02,
+        horizon_steps=25,
+        rollouts=2000,
+        lam=5,
+        sigma=np.array(
+            [0.1, 0.1, 0.01, 0.0807464837],
+            dtype=np.float32,
+        ),
+        T_max=0.4776,
+        ang_max=math.radians(20),
+        yaw_max=math.radians(20),
+        tau_roll=0.22,
+        tau_pitch=0.19,
+        tau_yaw=0.22,
+        drone_radius=0.04,
+        moving_r=0.04,
+        moving_safety_margin=0.0,
+        obs_pos_sigma_xyz=(0.01, 0.01, 0.01),
+        noise_mode="per_step",
+        cvar_alpha=0.95,
+        cvar_N=10,
+        risk_cost_A=2000,
+        risk_cost_Cu=0.0,
+        R_u=(5.7, 8.7, 3.1, 0.01),
+        Rd_u=(5.7, 8.7, 3.1, 0.01),
+    )
+
+
     device = "cuda" if (use_gpu and torch.cuda.is_available()) else "cpu"
-    ctrl = TorchRAQuad(mass=0.028, g=9.81, params=p, cylinders=cylinders, device=device)
+    ctrl = TorchRAMPPIQuadOuter(mass=0.028, g=9.81, params=params, device=device)
     print(f"Planner backend: {device} (cuda_available={int(torch.cuda.is_available())})")
 
-    # Tracking weights (yaw disabled)
-    Q  = np.array([40, 40, 40, 1], dtype=np.float32)
-    Qf = np.array([
-        40.,
-        40.,
-        40.,
-        0.0,
+    # [x, y, z, vx, vy, vz, roll, pitch, yaw]
+    Q = np.array([
+        1008, 1000, 1008,
+        25, 30, 13,
+        0.01, 0.01, 0.01,
     ], dtype=np.float32)
-
-    dt = p.dt
+    Qf = np.array([
+        1008, 1000, 1008,
+        25, 30, 13,
+        0.01, 0.01, 0.01,
+    ], dtype=np.float32)
+    dt = params.dt
     default_sim_T = max(
         [traj.total_time]
         + [
@@ -627,53 +741,43 @@ def simulate(
     sim_T = (steps - 1) * dt
 
     # initial state
-    p0, v0 = traj.eval(0.0)
+    ref0 = traj.eval(0.0)
     x = np.zeros(9, dtype=float)
-    x[0:3] = p0
+    x[0:3] = ref0[0:3]
     x[3:6] = 0.0
     x[6] = 0.0
-    x[7] = 0.0  # pitch
-    x[8] = 0.0  # yaw
+    x[7] = 0.0
+    x[8] = 0.0
 
     last_yaw_ref = float(x[8])
 
-    def yaw_follow_from_vel(v, fallback):
-        vx, vy = float(v[0]), float(v[1])
-        if vx*vx + vy*vy < 1e-6:
-            return fallback
-        return math.atan2(vy, vx)
-
     def eval_ego_loop(t_raw: float):
         if t_raw <= 0.0:
-            return traj.eval(0.0)
+            return traj.eval(0.0, yaw_fallback=last_yaw_ref)
         loop_T = max(1e-9, float(traj.total_time))
-        return traj.eval(float(t_raw) % loop_T)
+        return traj.eval(float(t_raw) % loop_T, yaw_fallback=last_yaw_ref)
 
-    def eval_moving_loop(moving_traj: MinSnapTraj, t_raw: float):
-        if t_raw <= 0.0:
-            return moving_traj.eval(0.0)
+    def eval_moving_loop(moving_traj: SimpleCrazyflieReference, t_raw: float):
         loop_T = max(1e-9, float(moving_traj.total_time))
-        return moving_traj.eval(float(t_raw) % loop_T)
+        ref = moving_traj.eval(float(t_raw) % loop_T)
+        return ref[0:3], ref[3:6]
 
-    lead_time = 1.5495997771078638  # aligned with mppi_crazyflie.py
-    moving_initial_advance = max(0.0, float(np.max(moving_time_offsets)) - lead_time + 1.0)
+    lead_time = 1.5495997771078638
+    moving_initial_advance = max(0.0, float(np.max(moving_time_offsets)) - lead_time + 5.3)
 
-    # Curves for background plot
+    # precompute curves for drawing
     tt = np.linspace(0.0, traj.total_time, 600)
-    ref_curve = np.array([traj.eval(float(tj))[0] for tj in tt])
+    ref_curve = np.array([traj.eval(float(tj))[0:3] for tj in tt])
 
     obs_curves = []
     for moving_traj in moving_trajs:
         tt2 = np.linspace(0.0, moving_traj.total_time, 600)
-        obs_curve = np.array([moving_traj.eval(float(tj))[0] for tj in tt2])
+        obs_curve = np.array([moving_traj.eval(float(tj))[0:3] for tj in tt2])
         obs_curves.append(obs_curve)
 
-    # bounds for plotting
     all_pts = np.vstack([ref_curve] + obs_curves)
     mins = all_pts.min(axis=0) - 1.0
     maxs = all_pts.max(axis=0) + 1.0
-
-    # buffers
     X_path = np.zeros((steps, 3), dtype=float)
     X_hist = np.zeros((steps, 9), dtype=float)
     n_obs = len(moving_trajs)
@@ -684,37 +788,30 @@ def simulate(
     pred_nominal_xyz = np.full((steps, ctrl.T + 1, 3), np.nan, dtype=np.float32)
     U_applied = np.zeros((steps, 4), dtype=float)
     solve_ms = np.zeros((steps,), dtype=float)
+    full_stage_cost = np.zeros((steps,), dtype=float)
+    tracking_stage_cost = np.zeros((steps,), dtype=float)
+    terminal_full_cost = 0.0
+    terminal_tracking_cost = 0.0
     min_obstacle_dist = np.full((steps,), np.nan, dtype=float)
     safety_flags = np.zeros((steps,), dtype=np.int8)
     collision_flags = np.zeros((steps,), dtype=np.int8)
     sim_time = np.arange(steps, dtype=float) * dt
-    drone_radius = float(getattr(p, "drone_radius", 0.3662153322325755))
-    moving_margin = float(getattr(p, "moving_safety_margin", getattr(p, "moving_margin", 0.0)))
-    cyl_margin = float(getattr(p, "cyl_safety_margin", getattr(p, "cyl_margin", 0.0)))
-    moving_collision_radius = float(p.moving_r + drone_radius)
-    moving_safe_radius = float(p.moving_r + moving_margin + drone_radius)
+    drone_radius = float(getattr(params, "drone_radius", 0.3662153322325755))
+    moving_margin = float(getattr(params, "moving_safety_margin", getattr(params, "moving_margin", 0.0)))
+    moving_collision_radius = float(params.moving_r + drone_radius)
+    moving_safe_radius = float(params.moving_r + moving_margin + drone_radius)
 
-    def collision_log_for_position(pos, obs_now):
+    def collision_log_for_position(p, obs_now):
         obs_points = np.asarray(obs_now, dtype=float).reshape(-1, 3)
-        move_dists = np.linalg.norm(obs_points - pos[None, :], axis=1) if obs_points.size else np.array([np.inf])
+        move_dists = np.linalg.norm(obs_points - p[None, :], axis=1) if obs_points.size else np.array([np.inf])
         min_dist = float(np.min(move_dists))
         safety = bool(np.any(move_dists < moving_safe_radius))
         collision = bool(np.any(move_dists < moving_collision_radius))
-        for c in cylinders:
-            dxy = float(np.hypot(float(pos[0]) - c["cx"], float(pos[1]) - c["cy"]))
-            min_dist = min(min_dist, dxy)
-            building_r = STATIC_BUILDING_RADIUS_SCALE * float(c["r"])
-            z = float(pos[2])
-            zmin = float(c.get("zmin", -1e9))
-            zmax = float(c.get("zmax", 1e9))
-            if zmin - drone_radius <= z <= zmax + drone_radius:
-                collision = collision or dxy < float(building_r + drone_radius)
-            if zmin - (drone_radius + cyl_margin) <= z <= zmax + (drone_radius + cyl_margin):
-                safety = safety or dxy < float(building_r + cyl_margin + drone_radius)
         return min_dist, safety, collision
     obs_update_steps = max(1, int(obs_update_steps))
     held_obs_seq = None
     last_obs_update_i = -10**9
+    obs_pos_sigma_xyz = np.asarray(params.obs_pos_sigma_xyz, dtype=float).reshape(1, 1, 3)
     ever_safety = False
     ever_collision = False
     first_collision_step = None
@@ -722,41 +819,45 @@ def simulate(
     for i in range(steps):
         t = i * dt
 
-        # build ref horizon (T+1,4): [px,py,pz,yaw_ref]
-        ref_seq = np.zeros((ctrl.mppi.T + 1, 4), dtype=float)
+        # build ref_seq (T+1,9): [x, y, z, vx, vy, vz, roll, pitch, yaw]
+        ref_seq = np.zeros((ctrl.T + 1, 9), dtype=float)
+        ref_seq[0] = eval_ego_loop(t)
+        ref_seq[0, 8] = last_yaw_ref + wrap_pi(float(ref_seq[0, 8]) - last_yaw_ref)
 
-        ref_seq[0, 0:3], v_now = eval_ego_loop(t)
-        yaw0_raw = wrap_pi(yaw_follow_from_vel(v_now, last_yaw_ref))
-        ref_seq[0, 3] = last_yaw_ref + wrap_pi(yaw0_raw - last_yaw_ref)
-
-        for k in range(1, ctrl.mppi.T + 1):
+        for k in range(1, ctrl.T + 1):
             tk = t + k * dt
-            pk, vk = eval_ego_loop(tk)
-            yaw_raw = wrap_pi(yaw_follow_from_vel(vk, ref_seq[k-1, 3]))
-            prev = ref_seq[k-1, 3]
-            ref_seq[k, 0:3] = pk
-            ref_seq[k, 3] = prev + wrap_pi(yaw_raw - prev)
+            prev = float(ref_seq[k - 1, 8])
+            ref_seq[k] = traj.eval(tk % max(1e-9, float(traj.total_time)), yaw_fallback=prev)
+            ref_seq[k, 8] = prev + wrap_pi(float(ref_seq[k, 8]) - prev)
 
-        last_yaw_ref = float(ref_seq[1, 3])
+        last_yaw_ref = float(ref_seq[1, 8])
 
-        # build moving obstacle horizon (T+1,n_obs,3), ahead by lead_time
-        obs_seq = np.zeros((ctrl.mppi.T + 1, n_obs, 3), dtype=float)
+        obs_seq = np.zeros((ctrl.T + 1, n_obs, 3), dtype=float)
         for j, moving_traj in enumerate(moving_trajs):
-            for k in range(ctrl.mppi.T + 1):
+            for k in range(ctrl.T + 1):
                 tk = t + lead_time + moving_initial_advance + k * dt - float(moving_time_offsets[j])
                 op, _ = eval_moving_loop(moving_traj, tk)
                 obs_seq[k, j] = op
+
         obs_path[i] = obs_seq[0]
         true_obs_seq = obs_seq
         if held_obs_seq is None or (i - last_obs_update_i) >= obs_update_steps:
-            held_obs_seq = true_obs_seq.copy()
+            obs_noise = np.random.normal(
+                loc=0.0,
+                scale=obs_pos_sigma_xyz,
+                size=true_obs_seq.shape,
+            )
+            held_obs_seq = true_obs_seq + obs_noise
             last_obs_update_i = i
         obs_seq = held_obs_seq
 
-        # plan (time it)
         if ctrl.device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
+        u_nom0 = np.asarray(ctrl.mppi.U_cpu[0], dtype=float).copy()
+        # LAG HOTSPOT:
+        # Enabling prediction collection triggers sample extraction + GPU->CPU transfer.
+        # Lower frequency (increase pred_stride) to reduce solve-time overhead.
         collect_pred = (i % pred_stride) == 0
         if collect_pred:
             u, pred_s_xyz, pred_nom_xyz = ctrl.plan(
@@ -764,18 +865,20 @@ def simulate(
                 ref_seq,
                 Q,
                 Qf,
-                obs_seq_np=obs_seq,
+                obs_seq,
                 return_predictions=True,
                 n_pred=n_pred_plot,
                 include_nominal_prediction=True,
             )
         else:
-            u = ctrl.plan(x, ref_seq, Q, Qf, obs_seq_np=obs_seq, return_predictions=False)
+            u = ctrl.plan(x, ref_seq, Q, Qf, obs_seq, return_predictions=False)
             pred_s_xyz = None
             pred_nom_xyz = None
         if ctrl.device.type == "cuda":
             torch.cuda.synchronize()
         solve_ms[i] = (time.perf_counter() - t0) * 1000.0
+        # LAG HOTSPOT:
+        # Storing full prediction buffers each step increases memory traffic.
         if collect_pred and pred_s_xyz is not None:
             ns = min(n_pred_plot, int(pred_s_xyz.shape[1]))
             pred_samples_xyz[i, :, :ns, :] = pred_s_xyz[:, :ns, :]
@@ -787,30 +890,30 @@ def simulate(
             pred_nominal_xyz[i] = pred_nominal_xyz[i - 1]
 
         if (i % 10) == 0:
-            print(f"[RA_MPPI] step={i:04d} t={t:6.2f}s solve={solve_ms[i]:7.2f} ms")
+            print(f"[step {i:04d}] solve_ms={solve_ms[i]:.2f}")
 
-        # apply one step (same sim dynamics)
         roll_c, pitch_c, yaw_c, thrust = map(float, u)
-        roll_c = clamp(roll_c, -p.ang_max, p.ang_max)
-        pitch_c = clamp(pitch_c, -p.ang_max, p.ang_max)
-        yaw_c = clamp(yaw_c, -p.yaw_max, p.yaw_max)
-        thrust = clamp(thrust, 0.0, 2.0 * ctrl.m * ctrl.g)
+        roll_c = clamp(roll_c, -ctrl.p.ang_max, ctrl.p.ang_max)
+        pitch_c = clamp(pitch_c, -ctrl.p.ang_max, ctrl.p.ang_max)
+        yaw_c = clamp(yaw_c, -ctrl.p.yaw_max, ctrl.p.yaw_max)
+        thrust = clamp(thrust, ctrl.p.T_min, ctrl.p.T_max)
         U_applied[i] = [roll_c, pitch_c, yaw_c, thrust]
 
         roll = float(x[6])
         pitch = float(x[7])
         yaw = float(x[8])
         croll = math.cos(roll); sroll = math.sin(roll)
-        cpitch  = math.cos(pitch); spitch = math.sin(pitch)
+        cpitch = math.cos(pitch); spitch = math.sin(pitch)
         cyaw = math.cos(yaw); syaw = math.sin(yaw)
-        zb = np.array([cyaw * spitch * croll + syaw * sroll,
-                       syaw * spitch * croll - cyaw * sroll,
-                       cpitch * croll], dtype=float)
-
-        a = (thrust / ctrl.m) * zb - np.array([0.0, 0.0, ctrl.g], dtype=float)
-        roll_dot = (roll_c - roll) / max(1e-6, p.tau_roll)
-        pitch_dot = (pitch_c - pitch) / max(1e-6, p.tau_pitch)
-        yaw_dot = (yaw_c - yaw) / max(1e-6, p.tau_yaw)
+        zb = np.array([
+            cyaw * spitch * croll + syaw * sroll,
+            syaw * spitch * croll - cyaw * sroll,
+            cpitch * croll,
+        ], dtype=float)
+        a = (thrust / ctrl.m) * zb - np.array([0.0, 0.0, ctrl.g])
+        roll_dot = (roll_c - roll) / max(1e-6, ctrl.p.tau_roll)
+        pitch_dot = (pitch_c - pitch) / max(1e-6, ctrl.p.tau_pitch)
+        yaw_dot = (yaw_c - yaw) / max(1e-6, ctrl.p.tau_yaw)
 
         x[3:6] = x[3:6] + dt * a
         x[0:3] = x[0:3] + dt * x[3:6]
@@ -820,6 +923,27 @@ def simulate(
 
         X_path[i] = x[0:3]
         X_hist[i] = x.copy()
+        tracking_stage_cost[i] = _executed_tracking_stage_cost_np(
+            x=x,
+            u=U_applied[i],
+            ref=ref_seq[1],
+            Q=Q,
+            R=ctrl.R_np,
+            u_nom=u_nom0,
+            Rd=ctrl.Rd_np,
+        )
+        full_stage_cost[i] = _executed_full_stage_cost_np(
+            x=x,
+            u=U_applied[i],
+            ref=ref_seq[1],
+            Q=Q,
+            R=ctrl.R_np,
+            u_nom=u_nom0,
+            Rd=ctrl.Rd_np,
+            params=params,
+            obs_now=obs_seq[1],
+            rng=np.random.default_rng(1000003 + i),
+        )
         dmin, hit_safety, hit_collision = collision_log_for_position(x[0:3], true_obs_seq[0])
         min_obstacle_dist[i] = dmin
         safety_flags[i] = int(hit_safety)
@@ -836,6 +960,10 @@ def simulate(
                 f"dmin={dmin:.3f} safety={int(hit_safety)} collision={int(hit_collision)}"
             )
 
+    terminal_full_cost = _state_error_cost_np(x, ref_seq[1], Qf)
+    terminal_tracking_cost = _state_error_cost_np(x, ref_seq[1], Qf)
+    total_full_cost = float(np.sum(full_stage_cost) + terminal_full_cost)
+    total_tracking_cost = float(np.sum(tracking_stage_cost) + terminal_tracking_cost)
     print(
         f"[RA_MPPI summary] min_dist={np.nanmin(min_obstacle_dist):.3f} "
         f"safety={int(ever_safety)} collision={int(ever_collision)} "
@@ -845,6 +973,7 @@ def simulate(
 
     run_data = {
         "method": "ramppi",
+        "trajectory_type": np.array(trajectory_type),
         "dt": float(dt),
         "sim_time": sim_time,
         "sim_steps": np.array(steps, dtype=np.int32),
@@ -854,6 +983,12 @@ def simulate(
         "obs_path": obs_path,
         "U_applied": U_applied,
         "solve_ms": solve_ms,
+        "full_stage_cost": full_stage_cost,
+        "tracking_stage_cost": tracking_stage_cost,
+        "terminal_full_cost": np.array(terminal_full_cost, dtype=float),
+        "total_full_cost": np.array(total_full_cost, dtype=float),
+        "terminal_tracking_cost": np.array(terminal_tracking_cost, dtype=float),
+        "total_tracking_cost": np.array(total_tracking_cost, dtype=float),
         "min_obstacle_dist": min_obstacle_dist,
         "safety_flags": safety_flags,
         "collision_flags": collision_flags,
@@ -862,17 +997,20 @@ def simulate(
         "moving_collision_radius": np.array(moving_collision_radius, dtype=float),
         "moving_safe_radius": np.array(moving_safe_radius, dtype=float),
         "drone_radius": np.array(drone_radius, dtype=float),
+        "obs_pos_sigma_xyz": np.asarray(params.obs_pos_sigma_xyz, dtype=float),
+        "noise_mode": np.array(params.noise_mode),
+        "cvar_alpha": np.array(params.cvar_alpha, dtype=float),
+        "cvar_N": np.array(params.cvar_N, dtype=np.int32),
+        "risk_cost_A": np.array(params.risk_cost_A, dtype=float),
+        "risk_cost_Cu": np.array(params.risk_cost_Cu, dtype=float),
         "obs_update_steps": np.array(obs_update_steps, dtype=np.int32),
         "ref_curve": ref_curve,
         "obs_curves": np.asarray(obs_curves, dtype=float),
+        "moving_speed_schedules": np.asarray(moving_speed_schedules, dtype=float),
         "mins": mins,
         "maxs": maxs,
         "pred_samples_xyz": pred_samples_xyz,
         "pred_nominal_xyz": pred_nominal_xyz,
-        "cylinders": np.asarray(
-            [[c["cx"], c["cy"], c["r"], c.get("zmin", 0.0), c.get("zmax", 1.0)] for c in cylinders],
-            dtype=float,
-        ),
     }
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -885,8 +1023,8 @@ def simulate(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run RA-MPPI Crazyflie simulation.")
     parser.add_argument("--save", action="store_true", help="Save simulation .npz to the plot directory.")
-    parser.add_argument("--obs-update-steps", type=int, default=1, help="Read fresh moving-obstacle observations every N control steps and hold between reads.")
-    parser.add_argument("--steps", type=int, default=None, help="Number of simulation control steps. The ego and moving paths loop for this many steps.")
+    parser.add_argument("--obs-update-steps", type=int, default=15, help="Read fresh moving-obstacle observations every N control steps and hold between reads.")
+    parser.add_argument("--steps", type=int, default=520, help="Number of simulation control steps. The ego and moving paths loop for this many steps.")
     parser.add_argument("--use_gpu", "--cuda", dest="use_gpu", action="store_true", default=True, help="Use CUDA when available (default).")
     parser.add_argument("--cpu", dest="use_gpu", action="store_false", help="Force CPU even when CUDA is available.")
     args = parser.parse_args()

@@ -3,9 +3,8 @@
 Parallel epsilon sweep for DR_mppi_crazyflie.py.
 
 Example:
-python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 8 --obs-update-steps 15 --steps 400
-python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 1 --obs-update-steps 15 --steps 400 --use_gpu
-python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 8 --obs-update-steps 15 --steps 400 --append true
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 1 --obs-update-steps 15 --steps 520 --use_gpu
+python3 stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.0 --eps-max 0.1 --eps-step 0.005 --workers 8 --obs-update-steps 15 --steps 520 --append true
 """
 
 from __future__ import annotations

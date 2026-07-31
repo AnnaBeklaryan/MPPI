@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_X_MAX = 0.2
+DEFAULT_X_MAX = 0.1
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,13 +41,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv",
         type=Path,
-        default=here / "dr_epsilon_summary_copy.csv",
-        help="Path to dr_epsilon_summary_copy.csv",
+        default=here / "dr_epsilon_summary.csv",
+        help="Path to dr_epsilon_summary.csv",
     )
     parser.add_argument(
         "--out",
         type=Path,
-        default=here / "dr_epsilon_collision_probability_s2.svg",
+        default=here / "dr_epsilon_collision_probability.svg",
         help="Output plot path for the linear-x plot.",
     )
     parser.add_argument(
@@ -91,7 +91,7 @@ def load_summary(csv_path: Path) -> pd.DataFrame:
 def _apply_common_style(ax: plt.Axes) -> None:
     ax.set_xlabel("Wasserstein radius, $\\varepsilon$")
     ax.set_ylabel("Collision probability")
-    ax.set_ylim(-0.03, 1.0)
+    ax.set_ylim(-0.03, 1.03)
     ax.yaxis.set_major_locator(MultipleLocator(0.2))
     ax.yaxis.set_minor_locator(MultipleLocator(0.1))
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
@@ -164,7 +164,7 @@ def main() -> None:
         }
     )
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    fig, ax = plt.subplots(figsize=(7.2, 3.4))
     ax.plot(
         plot_df["epsilon"].to_numpy(dtype=float),
         plot_df["collision_prob"].to_numpy(dtype=float),
@@ -190,7 +190,7 @@ def main() -> None:
         )
         return
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    fig, ax = plt.subplots(figsize=(7.2, 3.4))
     ax.plot(
         log_df["epsilon"].to_numpy(dtype=float),
         log_df["collision_prob"].to_numpy(dtype=float),

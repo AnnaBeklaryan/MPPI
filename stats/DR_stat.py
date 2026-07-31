@@ -210,7 +210,7 @@ def build_sim_setup(
     cvar_N = 10
     obs_pos_sigma = (0.07, 0.07)
     obs_noise_mode = "per_step"
-    risk_cost_A = 10.0
+    risk_cost_A = 100.0
     risk_cost_Cu = 0.0
     dyn_w_max = float(np.deg2rad(180.0))
 
@@ -284,7 +284,6 @@ def build_sim_setup(
         Q=Q,
         R=R,
         Qf=Qf,
-        plain_obs_w=0.0,
         ego_length=ego_length,
         ego_width=ego_width,
         obs_length=obs_length,
@@ -369,7 +368,6 @@ def build_sim_setup(
             O_mean=None,
             O_phi=None,
             radii=None,
-            obs_w=0.0,
             ego_half_length=None,
             ego_half_width=None,
             obs_half_length=None,

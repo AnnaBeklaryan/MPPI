@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parallel epsilon sweep for DR_mppi_crazyflie copy.py.
+Parallel epsilon sweep for DR_mppi_crazyflie.py.
 
 Example:
 python3 results_dr_cf_diff_eps_stats/DR_stat_cf_parallel.py --runs 100 --eps-min 0.00 --eps-max 0.2 --eps-step 0.005 --workers 3 --obs-update-steps 15 --steps 700 --use_gpu
@@ -36,7 +36,7 @@ if str(ROOT_DIR) not in sys.path:
 
 DEFAULT_EPSILONS = np.arange(0.0, 0.1001, 0.005, dtype=np.float64)
 DEFAULT_OUTDIR = Path(__file__).resolve().parent
-DEFAULT_SCENARIO_FILE = ROOT_DIR / "DR_mppi_crazyflie copy.py"
+DEFAULT_SCENARIO_FILE = ROOT_DIR / "DR_mppi_crazyflie.py"
 cf_dr = None
 RUN_COLUMNS = [
     "epsilon",
@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
         "--scenario-file",
         type=str,
         default=str(DEFAULT_SCENARIO_FILE),
-        help="DR Crazyflie simulator file to import. Defaults to 'DR_mppi_crazyflie copy.py'.",
+        help="DR Crazyflie simulator file to import. Defaults to 'DR_mppi_crazyflie.py'.",
     )
     ap.add_argument(
         "--append",
@@ -305,8 +305,8 @@ def _run_one_simulation(eps: float, run_seed: int, args_dict: dict[str, Any]) ->
         save_dir=None,
         obs_update_steps=int(args_dict["obs_update_steps"]),
         use_gpu=bool(args_dict["use_gpu"]),
-        dr_eps_cvar=float(eps),
         sim_steps=int(args_dict["steps"]),
+        dr_eps_cvar=float(eps),
     )
     if bool(args_dict["quiet_sim"]):
         with contextlib.redirect_stdout(io.StringIO()):

@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--scenario", type=int, choices=[1, 2], default=1, help="Scenario 1 uses the straight-road setup; scenario 2 uses the roundabout setup.")
     ap.add_argument("--csv", type=str, default="", help="Optional override path to obstacle CSV. If omitted, the file is chosen from --scenario.")
     ap.add_argument("--runs", type=int, default=100)
-    ap.add_argument("--outdir", type=str, default="results_dr_eps_stats")
+    ap.add_argument("--outdir", type=str, default="results_dr_eps_stats_rect")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--steps", type=int, default=900)
     ap.add_argument("--alpha", type=float, default=0.95, help="CVaR alpha used by DR-MPPI.")

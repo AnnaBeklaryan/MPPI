@@ -36,10 +36,10 @@ METHOD_LABELS: Dict[str, str] = {
     "dramppi": "DRA-MPPI",
 }
 METHOD_COLORS: Dict[str, str] = {
-    "mppi": "#095ed5",
-    "ramppi": "#9509b8",
-    "drmppi": "#26867b",
-    "dramppi": "#ff7300",
+    "mppi": "#5B9BFF",
+    "ramppi": "#C56BE3",
+    "drmppi": "#55B8AC",
+    "dramppi": "#FFAA5C",
 }
 GROUND_COLOR = "#ece9e2"
 ROAD_COLOR = "#646464"
@@ -50,6 +50,10 @@ OBSTACLE_HISTORY_ALPHA_NEAR = 0.34
 OBSTACLE_HISTORY_ALPHA_FAR = 0.10
 EGO_OUTLINE_COLOR = "#73f0ff"
 OBS_OUTLINE_COLOR = "#ffb15a"
+AXIS_LABEL_FONTSIZE = 50
+AXIS_TICK_FONTSIZE = 50
+AXIS_TICK_PAD = 12
+ANNOTATION_FONTSIZE = 2
 
 
 def _hex_to_rgb01(color: str) -> np.ndarray:
@@ -218,17 +222,17 @@ def _lane_width_from_data(data: dict) -> float:
 
 def _figure_size_for_scenario(scenario: int) -> tuple[float, float]:
     if scenario == 2:
-        return (11.0, 8.5)
-    return (14.0, 5.0)
+        return (16.0, 12.0)
+    return (18.0, 7.0)
 
 
 def _apply_figure_layout(fig, scenario: int) -> None:
     if scenario == 2:
         # The roundabout frames do not draw the side legend or a title, so use
-        # the canvas more efficiently and trim the large left/right whitespace.
-        fig.subplots_adjust(left=0.08, right=0.985, bottom=0.09, top=0.985)
+        # generous margins for the large axis labels and tick numbers.
+        fig.subplots_adjust(left=0.13, right=0.97, bottom=0.16, top=0.97)
     else:
-        fig.subplots_adjust(left=0.07, right=0.985, bottom=0.10, top=0.97)
+        fig.subplots_adjust(left=0.11, right=0.97, bottom=0.22, top=0.95)
 
 
 def _fixed_axis_limits_for_scenario(
@@ -615,6 +619,13 @@ def _infer_collision_hist(
     return out
 
 
+def _collision_segment_centers(collision_hist: np.ndarray) -> np.ndarray:
+    flags = np.asarray(collision_hist, dtype=bool).reshape(-1)
+    starts = np.flatnonzero(flags & ~np.r_[False, flags[:-1]])
+    ends = np.flatnonzero(flags & ~np.r_[flags[1:], False])
+    return ((starts + ends) // 2).astype(int)
+
+
 def _replay_method(
     method: str,
     data: dict,
@@ -721,8 +732,14 @@ def _replay_method(
     fig, ax = plt.subplots(figsize=_figure_size_for_scenario(scenario))
     _apply_figure_layout(fig, scenario)
 
-    ax.set_xlabel("x [scaled m]")
-    ax.set_ylabel("y [scaled m]")
+    ax.set_xlabel("x [m]", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("y [m]", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(
+        axis="both",
+        which="major",
+        labelsize=AXIS_TICK_FONTSIZE,
+        pad=AXIS_TICK_PAD,
+    )
     extra_handles, extra_labels = _setup_scene(
         ax,
         data=data,
@@ -769,7 +786,20 @@ def _replay_method(
         ln, = ax.plot([], [], lw=1.1, color="#9ee2e9", alpha=0.12, zorder=1)
         sample_lines.append(ln)
 
-    path_line, = ax.plot([], [], lw=2.6, color="#67bde2", label="Ego path")
+    method_color = METHOD_COLORS[method]
+    path_line, = ax.plot([], [], lw=2.6, color=method_color, label=f"{METHOD_LABELS[method]} path")
+    collision_line, = ax.plot([], [], lw=4.0, color="#D00000", zorder=4.2)
+    collision_stars, = ax.plot(
+        [],
+        [],
+        linestyle="None",
+        marker="*",
+        markersize=10,
+        markerfacecolor="#D00000",
+        markeredgecolor="#D00000",
+        zorder=4.5,
+    )
+    collision_center_steps = _collision_segment_centers(collision_hist[:n_steps])
     pred_line, = ax.plot([], [], lw=2.2, color="#36ff0e", alpha=0.95, label="MPPI prediction", zorder=3)
     # Reference / waypoint plotting intentionally disabled.
 
@@ -788,7 +818,7 @@ def _replay_method(
             0.0,
             "",
             color="white",
-            fontsize=8,
+            fontsize=ANNOTATION_FONTSIZE,
             ha="center",
             va="bottom",
             visible=False,
@@ -813,6 +843,15 @@ def _replay_method(
 
     for i in range(n_steps):
         path_line.set_data(x_path[: i + 2, 0], x_path[: i + 2, 1])
+        collision_xy = x_hist[: i + 1, :2].copy()
+        collided_so_far = np.asarray(collision_hist[: i + 1], dtype=bool)
+        collision_xy[~collided_so_far] = np.nan
+        collision_line.set_data(collision_xy[:, 0], collision_xy[:, 1])
+        visible_centers = collision_center_steps[collision_center_steps <= i]
+        if visible_centers.size > 0:
+            collision_stars.set_data(x_hist[visible_centers, 0], x_hist[visible_centers, 1])
+        else:
+            collision_stars.set_data([], [])
 
         nom = pred_nominal_xy[i]
         valid_nom = np.isfinite(nom[:, 0]) & np.isfinite(nom[:, 1])
@@ -960,6 +999,10 @@ def _replay_compare(
         method: _infer_collision_hist(all_data[method], obs_xy, obs_phi, k_hist, n_steps)
         for method in METHOD_ORDER
     }
+    collision_center_steps = {
+        method: _collision_segment_centers(collision_hists[method])
+        for method in METHOD_ORDER
+    }
     collision_ever_hists = {
         method: np.maximum.accumulate(collision_hists[method]).astype(int)
         for method in METHOD_ORDER
@@ -1002,8 +1045,14 @@ def _replay_compare(
     fig, ax = plt.subplots(figsize=_figure_size_for_scenario(scenario))
     _apply_figure_layout(fig, scenario)
 
-    ax.set_xlabel("x [scaled m]")
-    ax.set_ylabel("y [scaled m]")
+    ax.set_xlabel("x [m]", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("y [m]", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(
+        axis="both",
+        which="major",
+        labelsize=AXIS_TICK_FONTSIZE,
+        pad=AXIS_TICK_PAD,
+    )
     extra_handles, extra_labels = _setup_scene(
         ax,
         data=base_data,
@@ -1048,6 +1097,8 @@ def _replay_compare(
     # Reference / waypoint plotting intentionally disabled.
 
     path_lines = {}
+    collision_lines = {}
+    collision_stars = {}
     ego_markers = {}
     ego_outlines = {}
     for method in METHOD_ORDER:
@@ -1066,6 +1117,17 @@ def _replay_compare(
             zorder=6 + 0.1 * METHOD_ORDER.index(method),
         )
         path_lines[method] = line
+        collision_lines[method], = ax.plot([], [], lw=4.0, color="#D00000", zorder=4.2)
+        collision_stars[method], = ax.plot(
+            [],
+            [],
+            linestyle="None",
+            marker="*",
+            markersize=10,
+            markerfacecolor="#D00000",
+            markeredgecolor="#D00000",
+            zorder=4.5,
+        )
         ego_markers[method] = marker
         ego_outlines[method] = _add_pose_bubble(
             ax,
@@ -1089,7 +1151,7 @@ def _replay_compare(
             0.0,
             "",
             color="white",
-            fontsize=8,
+            fontsize=ANNOTATION_FONTSIZE,
             ha="center",
             va="bottom",
             visible=False,
@@ -1117,6 +1179,18 @@ def _replay_compare(
         for method in METHOD_ORDER:
             path_end = min(i + 2, x_paths[method].shape[0])
             path_lines[method].set_data(x_paths[method][:path_end, 0], x_paths[method][:path_end, 1])
+            collision_xy = x_hists[method][: i + 1, :2].copy()
+            collided_so_far = np.asarray(collision_hists[method][: i + 1], dtype=bool)
+            collision_xy[~collided_so_far] = np.nan
+            collision_lines[method].set_data(collision_xy[:, 0], collision_xy[:, 1])
+            visible_centers = collision_center_steps[method][collision_center_steps[method] <= i]
+            if visible_centers.size > 0:
+                collision_stars[method].set_data(
+                    x_hists[method][visible_centers, 0],
+                    x_hists[method][visible_centers, 1],
+                )
+            else:
+                collision_stars[method].set_data([], [])
             ego_markers[method].set_data([x_hists[method][i, 0]], [x_hists[method][i, 1]])
             if int(collision_ever_hists[method][i]) != 0:
                 ego_markers[method].set_markeredgecolor("#ff2d2d")

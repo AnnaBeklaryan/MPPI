@@ -164,7 +164,7 @@ def main() -> None:
         }
     )
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    fig, ax = plt.subplots(figsize=(7.2, 3.4))
     ax.plot(
         plot_df["epsilon"].to_numpy(dtype=float),
         plot_df["collision_prob"].to_numpy(dtype=float),
@@ -190,7 +190,7 @@ def main() -> None:
         )
         return
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    fig, ax = plt.subplots(figsize=(7.2, 3.4))
     ax.plot(
         log_df["epsilon"].to_numpy(dtype=float),
         log_df["collision_prob"].to_numpy(dtype=float),
