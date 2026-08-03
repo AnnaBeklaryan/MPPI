@@ -1,10 +1,10 @@
 Metric,MPPI,RAMPPI,DRMPPI,DRAMPPI
-1) Min distance across runs (min of run minima),0.0327,0.0669,0.0791,0.0393
-2) Run-min distance (mean +/- std),0.0547 +/- (0.0054),0.0804 +/- (0.0049),0.0914 +/- (0.0050),0.0692 +/- (0.0083)
-3) Safety violation probability using simulator flags,1.0000,0.4400,0.0300,0.9300
-4) Collision probability using simulator flags,1.0000,0.4400,0.0300,0.9300
-5) Total tracking/control cost over collision-free runs (mean +/- std),nan +/- (nan),1356.3741 +/- (67.5243),1734.9741 +/- (87.6849),1255.0287 +/- (59.4704)
-6) Max compute time across runs (ms),184.9302,90.2728,90.9139,100.7951
-7) Run-max compute time (mean +/- std) (ms),35.0676 +/- (16.4684),36.8058 +/- (8.8856),38.4905 +/- (10.3414),39.2689 +/- (12.3417)
-8) Mean compute time per step (mean +/- std) (ms),28.6371 +/- (0.9001),31.0595 +/- (1.0778),31.4154 +/- (1.0763),31.7950 +/- (0.9438)
-9) Wall time per episode (mean +/- std) (s),15.4250 +/- (0.4561),16.7193 +/- (0.5440),16.9028 +/- (0.5477),17.1017 +/- (0.4750)
+1) Min distance across runs (min of run minima),0.0372,0.0335,0.0783,0.0077
+2) Run-min distance (mean +/- std),0.0466 +/- (0.0039),0.0764 +/- (0.0072),0.0894 +/- (0.0052),0.0451 +/- (0.0167)
+3) Safety violation probability using simulator flags,1.0000,0.7000,0.0700,1.0000
+4) Collision probability using simulator flags,1.0000,0.7000,0.0700,1.0000
+5) Total tracking/control cost over collision-free runs (mean +/- std),nan +/- (nan),1315.1224 +/- (81.7999),1867.1653 +/- (83.2669),nan +/- (nan)
+6) Max compute time across runs (ms),387.4097,91.3201,69.0643,91.2209
+7) Run-max compute time (mean +/- std) (ms),38.4611 +/- (38.4899),30.0785 +/- (9.7500),34.0166 +/- (6.2519),32.6644 +/- (9.7661)
+8) Mean compute time per step (mean +/- std) (ms),16.5036 +/- (0.9348),17.5116 +/- (0.4616),21.3665 +/- (0.4803),19.3243 +/- (0.5806)
+9) Wall time per episode (mean +/- std) (s),9.9438 +/- (0.5299),10.5949 +/- (0.2731),12.6490 +/- (0.2751),11.4810 +/- (0.3369)
