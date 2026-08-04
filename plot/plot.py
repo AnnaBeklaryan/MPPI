@@ -114,7 +114,14 @@ def _style_axes(ax, mins: np.ndarray, maxs: np.ndarray) -> None:
     ax.set_zlim(*mins[[2]], *maxs[[2]])
     ax.set_xlabel("x [m]", fontsize=AXIS_LABEL_FONTSIZE, color="black", labelpad=AXIS_LABEL_PAD)
     ax.set_ylabel("y [m]", fontsize=AXIS_LABEL_FONTSIZE, color="black", labelpad=AXIS_LABEL_PAD)
-    ax.set_zlabel("z [m]", fontsize=AXIS_LABEL_FONTSIZE, color="black", labelpad=AXIS_LABEL_PAD)
+    ax.zaxis.set_rotate_label(False)
+    ax.set_zlabel(
+        "Altitude [m]",
+        fontsize=AXIS_LABEL_FONTSIZE,
+        color="black",
+        labelpad=AXIS_LABEL_PAD,
+        rotation=90,
+    )
     ax.set_facecolor("white")
     ax.set_box_aspect(np.maximum(maxs - mins, 1e-6), zoom=0.94)
     ax.view_init(elev=25, azim=-111)
