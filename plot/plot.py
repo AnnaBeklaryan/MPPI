@@ -124,7 +124,12 @@ def _style_axes(ax, mins: np.ndarray, maxs: np.ndarray) -> None:
     )
     ax.set_facecolor("white")
     ax.set_box_aspect(np.maximum(maxs - mins, 1e-6), zoom=0.94)
-    ax.view_init(elev=25, azim=-111)
+    try:
+        ax.view_init(elev=25, azim=-111, roll=0, vertical_axis="z")
+    except TypeError:
+        # Matplotlib 3.5 and earlier have no camera-roll arguments; their
+        # legacy 3D view keeps Z vertical by default.
+        ax.view_init(elev=25, azim=-111)
     pane = (0.957, 0.976, 0.988, 1.0)
     grid = (0.70, 0.76, 0.82, 0.75)
     ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
@@ -199,8 +204,6 @@ def _draw_obstacles(ax, data: dict[str, np.ndarray], obs: np.ndarray, frame: int
                     obstacle_radius: float) -> None:
     for j in range(obs.shape[1]):
         color = OBSTACLE_COLORS[j % len(OBSTACLE_COLORS)]
-        ax.plot(*obs[:frame + 1, j].T, color=color, linewidth=1.3, linestyle=":",
-                label=f"Obstacle {j + 1}")
         point = obs[frame, j]
         _cross(ax, point, color)
         _sphere(ax, point, obstacle_radius, color, 0.09)
@@ -222,7 +225,7 @@ def _draw_single(ax, method: str, data: dict[str, np.ndarray], frame: int,
     _static_scene(ax, data)
     _draw_obstacles(ax, data, obs, frame, obstacle_radius)
 
-    ax.plot(*path[:frame + 1].T, color=color, linewidth=1.8, label="Drone path")
+    ax.plot(*path[:frame + 1].T, color=color, linewidth=2.7, label="Drone path")
     point = path[frame]
     ax.scatter(*point, color=color, s=24, depthshade=False)
     _cross(ax, point, color, _rotation(data, frame))
@@ -272,7 +275,7 @@ def _draw_compare(ax, all_data: dict[str, dict[str, np.ndarray]], frame: int,
         path = np.asarray(data["X_path"], dtype=float)[:steps]
         flags = _flags(data, steps)
         color = DRONE_COLORS[method]
-        ax.plot(*path[:frame + 1].T, color=color, linewidth=1.8, label=LABELS[method])
+        ax.plot(*path[:frame + 1].T, color=color, linewidth=2.7, label=LABELS[method])
         point = path[frame]
         ax.scatter(*point, color=color, s=22, depthshade=False)
         _sphere(ax, point, _scalar(data, "drone_radius", base_radius), color, 0.09)
