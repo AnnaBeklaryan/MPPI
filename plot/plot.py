@@ -124,6 +124,7 @@ def _style_axes(ax, mins: np.ndarray, maxs: np.ndarray) -> None:
     )
     ax.set_facecolor("white")
     ax.set_box_aspect(np.maximum(maxs - mins, 1e-6), zoom=0.94)
+    ax.set_proj_type("ortho")
     try:
         ax.view_init(elev=25, azim=-111, roll=0, vertical_axis="z")
     except TypeError:
@@ -195,7 +196,7 @@ def _cube(ax, cube: np.ndarray) -> None:
 def _static_scene(ax, data: dict[str, np.ndarray]) -> None:
     ref = np.asarray(data.get("ref_curve", np.empty((0, 3))), dtype=float)
     if ref.size:
-        ax.plot(*ref.T, color="#2a6fdb", linewidth=1.5, linestyle=":", label="Reference")
+        ax.plot(*ref.T, color="#6B7280", linewidth=2.7, linestyle=":", label="Reference")
     for cube in np.asarray(data.get("cylinders", np.empty((0, 5))), dtype=float):
         _cube(ax, cube)
 
